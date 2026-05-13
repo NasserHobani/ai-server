@@ -1,0 +1,28 @@
+# CS AI Bridge API project.
+#
+# Host URL: http://localhost:8072
+
+name: cs-ai-bridge-api
+
+services:
+  cs-ai-bridge-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cs-ai-bridge-api:latest
+    container_name: cs-ai-bridge-api
+    restart: unless-stopped
+    ports:
+      - "8072:8080"
+    env_file:
+      - .env.example
+      - path: .env
+        required: false
+    environment:
+      CS_AI_BRIDGE_API_PORT: "8080"
+    networks:
+      - cs-ai-bridge-api
+
+networks:
+  cs-ai-bridge-api:
+    name: cs-ai-bridge-api

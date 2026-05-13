@@ -1,0 +1,7 @@
+# FastAPI LLM proxy image only - see projects/api/Dockerfile
+fastapi
+httpx
+pydantic
+python-dotenv
+redis
+uvicorn[standard]
