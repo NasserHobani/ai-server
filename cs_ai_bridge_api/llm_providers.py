@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any
@@ -10,6 +11,13 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import HTTPException
+
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_detail(detail: Any) -> str:
+    return str(detail).replace("\n", " ")[:1000]
 
 
 def normalize_provider(redis_cfg: dict[str, Any]) -> str:
@@ -237,12 +245,21 @@ async def upstream_chat_completion(
 
     if provider == "openai":
         api_key = resolve_openai_api_key(redis_cfg, env_openai_key)
+        logger.info(
+            "upstream_openai_prepare model=%s timeout=%s api_key_set=%s api_key_source=%s config_source=%s",
+            merged_body.get("model"),
+            timeout,
+            bool(api_key),
+            "redis" if isinstance(redis_cfg.get("api_key"), str) and redis_cfg.get("api_key", "").strip() else "env",
+            redis_cfg.get("_config_source", "<unknown>"),
+        )
         if not api_key:
             raise HTTPException(
                 status_code=503,
                 detail="OpenAI: set CS_AI_BRIDGE_LLM_API_KEY or OPENAI_API_KEY, or Redis api_key.",
             )
         url = _openai_chat_url(redis_cfg)
+        logger.info("upstream_openai_request url=%s model=%s", url, merged_body.get("model"))
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -256,10 +273,17 @@ async def upstream_chat_completion(
             try:
                 r = await client.post(url, json=merged_body, headers=headers)
             except httpx.RequestError as exc:
+                logger.warning("upstream_openai_request_error error=%s detail=%s", type(exc).__name__, exc)
                 raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
 
         ct = r.headers.get("content-type", "")
+        logger.info("upstream_openai_response status_code=%s content_type=%s", r.status_code, ct)
         if "application/json" not in ct:
+            logger.warning(
+                "upstream_openai_non_json status_code=%s body=%s",
+                r.status_code,
+                r.text[:500],
+            )
             raise HTTPException(
                 status_code=502,
                 detail=f"Upstream returned non-JSON ({r.status_code}): {r.text[:500]}",
@@ -270,6 +294,11 @@ async def upstream_chat_completion(
             raise HTTPException(status_code=502, detail="Upstream response was not valid JSON.") from exc
         if r.is_error:
             detail = data if isinstance(data, dict) else {"error": str(data)}
+            logger.warning(
+                "upstream_openai_error status_code=%s detail=%s",
+                r.status_code,
+                _safe_detail(detail),
+            )
             raise HTTPException(status_code=r.status_code, detail=detail)
         if isinstance(data, dict):
             data.setdefault("provider", "openai")
@@ -277,6 +306,14 @@ async def upstream_chat_completion(
 
     # Gemini
     api_key = resolve_gemini_api_key(redis_cfg)
+    logger.info(
+        "upstream_gemini_prepare model=%s timeout=%s api_key_set=%s api_key_source=%s config_source=%s",
+        merged_body.get("model"),
+        timeout,
+        bool(api_key),
+        "redis" if isinstance(redis_cfg.get("api_key"), str) and redis_cfg.get("api_key", "").strip() else "env",
+        redis_cfg.get("_config_source", "<unknown>"),
+    )
     if not api_key:
         raise HTTPException(
             status_code=503,
@@ -298,6 +335,8 @@ async def upstream_chat_completion(
 
     gemini_payload = _gemini_body(redis_cfg, merged_body, sys_inst, contents)
     url = _gemini_generate_url(redis_cfg, model, api_key)
+    safe_url = url.split("?key=", 1)[0] + "?key=<redacted>"
+    logger.info("upstream_gemini_request url=%s model=%s", safe_url, model)
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
@@ -307,10 +346,17 @@ async def upstream_chat_completion(
                 headers={"Content-Type": "application/json"},
             )
         except httpx.RequestError as exc:
+            logger.warning("upstream_gemini_request_error error=%s detail=%s", type(exc).__name__, exc)
             raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
 
     ct = r.headers.get("content-type", "")
+    logger.info("upstream_gemini_response status_code=%s content_type=%s", r.status_code, ct)
     if "application/json" not in ct:
+        logger.warning(
+            "upstream_gemini_non_json status_code=%s body=%s",
+            r.status_code,
+            r.text[:500],
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Gemini returned non-JSON ({r.status_code}): {r.text[:500]}",
@@ -322,6 +368,11 @@ async def upstream_chat_completion(
 
     if r.is_error:
         detail = data if isinstance(data, dict) else {"error": str(data)}
+        logger.warning(
+            "upstream_gemini_error status_code=%s detail=%s",
+            r.status_code,
+            _safe_detail(detail),
+        )
         raise HTTPException(status_code=r.status_code, detail=detail)
 
     if not isinstance(data, dict):

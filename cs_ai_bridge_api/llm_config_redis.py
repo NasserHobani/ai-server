@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
 
 import redis
 from redis.exceptions import RedisError
+
+
+logger = logging.getLogger(__name__)
 
 
 def redis_url() -> str | None:
@@ -59,6 +63,7 @@ def _env_runtime_config(provider: str | None) -> dict[str, Any] | None:
                 "CS_AI_BRIDGE_GEMINI_BASE_URL",
                 "https://generativelanguage.googleapis.com/v1beta",
             ),
+            "_config_source": "env",
         }
     if p == "openai":
         return {
@@ -68,6 +73,7 @@ def _env_runtime_config(provider: str | None) -> dict[str, Any] | None:
                 os.getenv("CS_AI_BRIDGE_LLM_MODEL", "gpt-4o-mini"),
             ),
             "base_url": os.getenv("CS_AI_BRIDGE_LLM_BASE_URL", "https://api.openai.com/v1"),
+            "_config_source": "env",
         }
     return None
 
@@ -101,6 +107,11 @@ def read_ai_runtime_config(tenant: str | None, provider: str | None = None) -> d
     client = get_redis_client_optional()
     if client is None:
         if fallback is not None:
+            logger.info(
+                "ai_config_using_env reason=redis_url_missing provider=%s model=%s",
+                fallback.get("provider"),
+                fallback.get("model"),
+            )
             return fallback
         raise ValueError("CS_AI_BRIDGE_REDIS_URL is not set; cannot load AI model configuration.")
 
@@ -109,10 +120,23 @@ def read_ai_runtime_config(tenant: str | None, provider: str | None = None) -> d
         raw = client.get(key)
     except RedisError as exc:
         if fallback is not None:
+            logger.warning(
+                "ai_config_using_env reason=redis_error key=%s provider=%s model=%s error=%s",
+                key,
+                fallback.get("provider"),
+                fallback.get("model"),
+                type(exc).__name__,
+            )
             return fallback
         raise ValueError(f"Could not read AI configuration from Redis key '{key}'.") from exc
     if raw is None:
         if fallback is not None:
+            logger.info(
+                "ai_config_using_env reason=redis_key_missing key=%s provider=%s model=%s",
+                key,
+                fallback.get("provider"),
+                fallback.get("model"),
+            )
             return fallback
         hint = f"tenant '{tenant}'" if tenant else "global key"
         raise ValueError(f"AI configuration not found in Redis for {hint} (key '{key}').")
@@ -122,4 +146,12 @@ def read_ai_runtime_config(tenant: str | None, provider: str | None = None) -> d
         raise ValueError(f"Invalid JSON in Redis AI config key '{key}'.") from exc
     if not isinstance(parsed, dict):
         raise ValueError(f"AI configuration in Redis key '{key}' must be a JSON object.")
+    parsed["_config_source"] = f"redis:{key}"
+    logger.info(
+        "ai_config_using_redis key=%s provider=%s model=%s api_key_in_redis=%s",
+        key,
+        parsed.get("provider", "openai"),
+        parsed.get("model"),
+        bool(str(parsed.get("api_key", "")).strip()),
+    )
     return parsed
