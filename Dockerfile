@@ -10,7 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app
 
 COPY requirements.txt /app/
-RUN pip install --upgrade pip && pip install -r requirements-api.txt
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY cs_ai_bridge_api /app/cs_ai_bridge_api
 
