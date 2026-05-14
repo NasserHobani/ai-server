@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import json
 import logging
 import os
 from typing import Any, AsyncIterator
@@ -10,6 +11,7 @@ import uuid
 
 from cs_ai_bridge_api.llm_config_redis import llm_api_key, read_ai_runtime_config, redis_url
 from cs_ai_bridge_api.llm_providers import merge_request_body, upstream_chat_completion
+from cs_ai_bridge_api.mcp_client import call_mcp_tools
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -37,6 +39,7 @@ class ChatCompletionRequest(BaseModel):
     messages: list[dict[str, Any]]
     tenant: str | None = None
     provider: str | None = None
+    mcp_tool_calls: list[dict[str, Any]] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -91,7 +94,39 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
         )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    body = req.model_dump(exclude_none=True)
+    body = req.model_dump(exclude_none=True, exclude={"mcp_tool_calls"})
+    mcp_results: list[dict[str, Any]] | None = None
+    if req.mcp_tool_calls:
+        try:
+            mcp_results = await call_mcp_tools(req.mcp_tool_calls, request_id)
+        except ValueError as exc:
+            logger.warning(
+                "mcp_tool_calls_invalid request_id=%s detail=%s",
+                request_id,
+                _safe_detail(str(exc)),
+            )
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.warning(
+                "mcp_tool_calls_failed request_id=%s error=%s detail=%s",
+                request_id,
+                type(exc).__name__,
+                _safe_detail(str(exc)),
+            )
+            raise HTTPException(status_code=502, detail=f"MCP tool call failed: {exc}") from exc
+
+        body["messages"] = [
+            *body["messages"],
+            {
+                "role": "system",
+                "content": (
+                    "MCP tool results for this request. Use this JSON as live business "
+                    "context when answering the user:\n"
+                    f"{json.dumps(mcp_results, ensure_ascii=False)}"
+                ),
+            },
+        ]
+
     merged = merge_request_body(body, redis_cfg)
     logger.info(
         "chat_completion_config_loaded request_id=%s source=%s provider=%s model=%s",
@@ -117,4 +152,6 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
         result.get("provider", redis_cfg.get("provider", "openai")),
         result.get("model", merged.get("model")),
     )
+    if mcp_results is not None:
+        result["mcp_results"] = mcp_results
     return result

@@ -221,6 +221,8 @@ def read_ai_runtime_config(tenant: str | None, provider: str | None = None) -> d
         keys.append(ai_config_redis_key(key_hint))
     if tenant_key:
         keys.append(assistants_config_redis_key(tenant_key))
+        if tenant_key != "tenant":
+            keys.append(assistants_config_redis_key("tenant"))
     if not keys:
         keys.append(ai_config_redis_key(None))
 

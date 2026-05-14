@@ -61,11 +61,22 @@ def _normalize_base_url(url: str) -> str:
     return url.rstrip("/")
 
 
+def _normalize_openai_metadata(out: dict[str, Any]) -> None:
+    metadata = out.get("metadata")
+    if metadata is None:
+        return
+    if not isinstance(metadata, dict):
+        out["metadata"] = {"value": str(metadata)}
+        return
+    out["metadata"] = {str(k): "" if v is None else str(v) for k, v in metadata.items()}
+
+
 def _merge_openai_payload(
     body: dict[str, Any],
     redis_cfg: dict[str, Any],
 ) -> dict[str, Any]:
     out = {k: v for k, v in body.items() if k not in {"tenant", "provider"}}
+    _normalize_openai_metadata(out)
     model = out.get("model")
     if not model:
         m = redis_cfg.get("model")
