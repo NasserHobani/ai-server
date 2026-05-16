@@ -61,14 +61,49 @@ def _normalize_base_url(url: str) -> str:
     return url.rstrip("/")
 
 
+def _coerce_openai_metadata_value(value: Any) -> str:
+    """OpenAI requires every metadata value to be a string."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
 def _normalize_openai_metadata(out: dict[str, Any]) -> None:
+    # Flat keys such as metadata.user_id (common from some HTTP clients)
+    for key in list(out.keys()):
+        if not key.startswith("metadata."):
+            continue
+        subkey = key[len("metadata.") :]
+        if not subkey:
+            continue
+        meta = out.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+        meta[subkey] = out.pop(key)
+        out["metadata"] = meta
+
     metadata = out.get("metadata")
     if metadata is None:
         return
     if not isinstance(metadata, dict):
-        out["metadata"] = {"value": str(metadata)}
+        out["metadata"] = {"value": _coerce_openai_metadata_value(metadata)}
         return
-    out["metadata"] = {str(k): "" if v is None else str(v) for k, v in metadata.items()}
+    out["metadata"] = {
+        str(k): _coerce_openai_metadata_value(v) for k, v in metadata.items()
+    }
+
+
+def prepare_openai_request_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy safe to POST to OpenAI chat/completions."""
+    payload = dict(body)
+    _normalize_openai_metadata(payload)
+    return payload
 
 
 def _merge_openai_payload(
@@ -270,7 +305,8 @@ async def upstream_chat_completion(
                 detail="OpenAI: set CS_AI_BRIDGE_LLM_API_KEY or OPENAI_API_KEY, or Redis api_key.",
             )
         url = _openai_chat_url(redis_cfg)
-        logger.info("upstream_openai_request url=%s model=%s", url, merged_body.get("model"))
+        openai_payload = prepare_openai_request_body(merged_body)
+        logger.info("upstream_openai_request url=%s model=%s", url, openai_payload.get("model"))
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -282,7 +318,7 @@ async def upstream_chat_completion(
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             try:
-                r = await client.post(url, json=merged_body, headers=headers)
+                r = await client.post(url, json=openai_payload, headers=headers)
             except httpx.RequestError as exc:
                 logger.warning("upstream_openai_request_error error=%s detail=%s", type(exc).__name__, exc)
                 raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
