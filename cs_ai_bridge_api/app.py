@@ -39,6 +39,8 @@ class ChatCompletionRequest(BaseModel):
     messages: list[dict[str, Any]]
     tenant: str | None = None
     provider: str | None = None
+    assistant_key: str | None = None
+    schema_key: str | None = None
     mcp_tool_calls: list[dict[str, Any]] | None = None
 
     @model_validator(mode="before")
@@ -63,7 +65,10 @@ app = FastAPI(
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "build": os.getenv("CS_AI_BRIDGE_API_BUILD_ID", "strip-bridge-fields-v2"),
+    }
 
 
 @app.get("/ready")
@@ -94,7 +99,16 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
         )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    body = req.model_dump(exclude_none=True, exclude={"mcp_tool_calls"})
+    body = req.model_dump(
+        exclude_none=True,
+        exclude={
+            "mcp_tool_calls",
+            "tenant",
+            "provider",
+            "assistant_key",
+            "schema_key",
+        },
+    )
     mcp_results: list[dict[str, Any]] | None = None
     if req.mcp_tool_calls:
         try:

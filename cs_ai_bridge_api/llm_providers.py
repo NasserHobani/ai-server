@@ -15,6 +15,72 @@ from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
+# CS AI Bridge selectors — must not be forwarded to OpenAI / Gemini HTTP APIs.
+_BRIDGE_ONLY_REQUEST_FIELDS = frozenset(
+    {
+        "tenant",
+        "provider",
+        "mcp_tool_calls",
+        "assistant_key",
+        "schema_key",
+        "assistantKey",
+        "schemaKey",
+    }
+)
+
+# OpenAI Chat Completions body fields (unknown keys cause 400 invalid_request_error).
+_OPENAI_CHAT_COMPLETION_ALLOWED = frozenset(
+    {
+        "messages",
+        "model",
+        "audio",
+        "frequency_penalty",
+        "logit_bias",
+        "logprobs",
+        "max_completion_tokens",
+        "max_tokens",
+        "metadata",
+        "modalities",
+        "n",
+        "parallel_tool_calls",
+        "prediction",
+        "presence_penalty",
+        "reasoning_effort",
+        "response_format",
+        "seed",
+        "service_tier",
+        "stop",
+        "store",
+        "stream",
+        "stream_options",
+        "temperature",
+        "tool_choice",
+        "tools",
+        "top_logprobs",
+        "top_p",
+        "user",
+        "web_search_options",
+        # Deprecated but still accepted by some gateways
+        "function_call",
+        "functions",
+    }
+)
+
+
+def _strip_bridge_only_fields(out: dict[str, Any]) -> None:
+    for key in list(out.keys()):
+        if key in _BRIDGE_ONLY_REQUEST_FIELDS or key.startswith("_"):
+            out.pop(key, None)
+
+
+def _filter_openai_allowed_fields(out: dict[str, Any]) -> list[str]:
+    removed: list[str] = []
+    for key in list(out.keys()):
+        if key not in _OPENAI_CHAT_COMPLETION_ALLOWED:
+            out.pop(key, None)
+            removed.append(key)
+    return removed
+
 
 def _safe_detail(detail: Any) -> str:
     return str(detail).replace("\n", " ")[:1000]
@@ -102,6 +168,10 @@ def _normalize_openai_metadata(out: dict[str, Any]) -> None:
 def prepare_openai_request_body(body: dict[str, Any]) -> dict[str, Any]:
     """Return a copy safe to POST to OpenAI chat/completions."""
     payload = dict(body)
+    _strip_bridge_only_fields(payload)
+    removed = _filter_openai_allowed_fields(payload)
+    if removed:
+        logger.info("openai_request_fields_removed keys=%s", ",".join(sorted(removed)))
     _normalize_openai_metadata(payload)
     return payload
 
@@ -110,7 +180,8 @@ def _merge_openai_payload(
     body: dict[str, Any],
     redis_cfg: dict[str, Any],
 ) -> dict[str, Any]:
-    out = {k: v for k, v in body.items() if k not in {"tenant", "provider"}}
+    out = dict(body)
+    _strip_bridge_only_fields(out)
     _normalize_openai_metadata(out)
     model = out.get("model")
     if not model:
@@ -306,7 +377,12 @@ async def upstream_chat_completion(
             )
         url = _openai_chat_url(redis_cfg)
         openai_payload = prepare_openai_request_body(merged_body)
-        logger.info("upstream_openai_request url=%s model=%s", url, openai_payload.get("model"))
+        logger.info(
+            "upstream_openai_request url=%s model=%s payload_keys=%s",
+            url,
+            openai_payload.get("model"),
+            ",".join(sorted(openai_payload.keys())),
+        )
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
