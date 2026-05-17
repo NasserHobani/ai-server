@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+from cs_ai_bridge_api.mcp_client import list_openai_function_tools
 from fastapi import HTTPException
 
 
@@ -39,7 +40,6 @@ _OPENAI_CHAT_COMPLETION_ALLOWED = frozenset(
         "logprobs",
         "max_completion_tokens",
         "max_tokens",
-        "metadata",
         "modalities",
         "n",
         "parallel_tool_calls",
@@ -86,6 +86,41 @@ def _safe_detail(detail: Any) -> str:
     return str(detail).replace("\n", " ")[:1000]
 
 
+def _truncate_body(value: Any, limit: int = 4000) -> Any:
+    if isinstance(value, str):
+        return value[:limit]
+    return value
+
+
+def _response_body_or_text(response: httpx.Response) -> Any:
+    ct = response.headers.get("content-type", "")
+    if "application/json" in ct:
+        try:
+            return response.json()
+        except ValueError:
+            return _truncate_body(response.text)
+    return _truncate_body(response.text)
+
+
+def _raise_upstream_error(
+    *,
+    provider: str,
+    status_code: int,
+    message: str,
+    body: Any = None,
+    error: str | None = None,
+) -> None:
+    detail: dict[str, Any] = {
+        "provider": provider,
+        "message": message,
+    }
+    if error:
+        detail["error"] = error
+    if body is not None:
+        detail["body"] = _truncate_body(body)
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
 def normalize_provider(redis_cfg: dict[str, Any]) -> str:
     raw = redis_cfg.get("provider", "openai")
     if not isinstance(raw, str):
@@ -127,52 +162,18 @@ def _normalize_base_url(url: str) -> str:
     return url.rstrip("/")
 
 
-def _coerce_openai_metadata_value(value: Any) -> str:
-    """OpenAI requires every metadata value to be a string."""
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, str):
-        return value
-    return str(value)
-
-
-def _normalize_openai_metadata(out: dict[str, Any]) -> None:
-    # Flat keys such as metadata.user_id (common from some HTTP clients)
-    for key in list(out.keys()):
-        if not key.startswith("metadata."):
-            continue
-        subkey = key[len("metadata.") :]
-        if not subkey:
-            continue
-        meta = out.get("metadata")
-        if not isinstance(meta, dict):
-            meta = {}
-        meta[subkey] = out.pop(key)
-        out["metadata"] = meta
-
-    metadata = out.get("metadata")
-    if metadata is None:
-        return
-    if not isinstance(metadata, dict):
-        out["metadata"] = {"value": _coerce_openai_metadata_value(metadata)}
-        return
-    out["metadata"] = {
-        str(k): _coerce_openai_metadata_value(v) for k, v in metadata.items()
-    }
-
-
 def prepare_openai_request_body(body: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy safe to POST to OpenAI chat/completions."""
+    """Return a copy safe to send to OpenAI (without bridge-only fields/metadata)."""
     payload = dict(body)
     _strip_bridge_only_fields(payload)
     removed = _filter_openai_allowed_fields(payload)
     if removed:
         logger.info("openai_request_fields_removed keys=%s", ",".join(sorted(removed)))
-    _normalize_openai_metadata(payload)
+    # User requested never forwarding metadata to AI.
+    payload.pop("metadata", None)
+    for key in list(payload.keys()):
+        if key.startswith("metadata."):
+            payload.pop(key, None)
     return payload
 
 
@@ -182,7 +183,6 @@ def _merge_openai_payload(
 ) -> dict[str, Any]:
     out = dict(body)
     _strip_bridge_only_fields(out)
-    _normalize_openai_metadata(out)
     model = out.get("model")
     if not model:
         m = redis_cfg.get("model")
@@ -199,13 +199,68 @@ def _merge_openai_payload(
     return out
 
 
-def _openai_chat_url(redis_cfg: dict[str, Any]) -> str:
+def _openai_responses_url(redis_cfg: dict[str, Any]) -> str:
     raw = redis_cfg.get("base_url") or os.getenv(
         "CS_AI_BRIDGE_LLM_BASE_URL", "https://api.openai.com/v1"
     )
     if not isinstance(raw, str) or not raw.strip():
         raise HTTPException(status_code=500, detail="Invalid base_url in Redis AI config.")
-    return f"{_normalize_base_url(raw.strip())}/chat/completions"
+    return f"{_normalize_base_url(raw.strip())}/responses"
+
+
+def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        role = str(msg.get("role", "user"))
+        text = _message_text(msg.get("content"))
+        out.append(
+            {
+                "role": role,
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": text,
+                    }
+                ],
+            }
+        )
+    return out
+
+
+def _responses_to_chat_completion_shape(data: dict[str, Any], model: str) -> dict[str, Any]:
+    text = ""
+    if isinstance(data.get("output_text"), str):
+        text = data["output_text"]
+    created = int(time.time())
+    usage_raw = data.get("usage")
+    usage: dict[str, int] = {}
+    if isinstance(usage_raw, dict):
+        inp = usage_raw.get("input_tokens")
+        outp = usage_raw.get("output_tokens")
+        total = usage_raw.get("total_tokens")
+        if isinstance(inp, int):
+            usage["prompt_tokens"] = inp
+        if isinstance(outp, int):
+            usage["completion_tokens"] = outp
+        if isinstance(total, int):
+            usage["total_tokens"] = total
+
+    return {
+        "id": data.get("id") or f"resp-{created}",
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "provider": "openai",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": usage or None,
+        "response": data,
+    }
 
 
 def _timeout_seconds(redis_cfg: dict[str, Any]) -> float:
@@ -375,13 +430,26 @@ async def upstream_chat_completion(
                 status_code=503,
                 detail="OpenAI: set CS_AI_BRIDGE_LLM_API_KEY or OPENAI_API_KEY, or Redis api_key.",
             )
-        url = _openai_chat_url(redis_cfg)
+        url = _openai_responses_url(redis_cfg)
         openai_payload = prepare_openai_request_body(merged_body)
+        messages = openai_payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise HTTPException(status_code=400, detail="messages must be a non-empty list.")
+        tools = await list_openai_function_tools(request_id=f"openai-{int(time.time())}")
+        responses_payload: dict[str, Any] = {
+            "model": str(openai_payload.get("model", "")),
+            "input": _messages_to_responses_input(messages),
+            "tools": tools,
+        }
+        if openai_payload.get("temperature") is not None:
+            responses_payload["temperature"] = openai_payload["temperature"]
+        if openai_payload.get("max_tokens") is not None:
+            responses_payload["max_output_tokens"] = openai_payload["max_tokens"]
         logger.info(
             "upstream_openai_request url=%s model=%s payload_keys=%s",
             url,
-            openai_payload.get("model"),
-            ",".join(sorted(openai_payload.keys())),
+            responses_payload.get("model"),
+            ",".join(sorted(responses_payload.keys())),
         )
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -394,10 +462,15 @@ async def upstream_chat_completion(
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             try:
-                r = await client.post(url, json=openai_payload, headers=headers)
+                r = await client.post(url, json=responses_payload, headers=headers)
             except httpx.RequestError as exc:
                 logger.warning("upstream_openai_request_error error=%s detail=%s", type(exc).__name__, exc)
-                raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
+                _raise_upstream_error(
+                    provider="openai",
+                    status_code=502,
+                    message="Upstream request failed.",
+                    error=str(exc),
+                )
 
         ct = r.headers.get("content-type", "")
         logger.info("upstream_openai_response status_code=%s content_type=%s", r.status_code, ct)
@@ -407,25 +480,43 @@ async def upstream_chat_completion(
                 r.status_code,
                 r.text[:500],
             )
-            raise HTTPException(
+            _raise_upstream_error(
+                provider="openai",
                 status_code=502,
-                detail=f"Upstream returned non-JSON ({r.status_code}): {r.text[:500]}",
+                message=f"Upstream returned non-JSON (status {r.status_code}).",
+                body=_response_body_or_text(r),
             )
         try:
             data = r.json()
         except ValueError as exc:
-            raise HTTPException(status_code=502, detail="Upstream response was not valid JSON.") from exc
+            _raise_upstream_error(
+                provider="openai",
+                status_code=502,
+                message="Upstream response was not valid JSON.",
+                body=_truncate_body(r.text),
+                error=str(exc),
+            )
         if r.is_error:
-            detail = data if isinstance(data, dict) else {"error": str(data)}
+            detail = data if isinstance(data, dict) else data
             logger.warning(
                 "upstream_openai_error status_code=%s detail=%s",
                 r.status_code,
                 _safe_detail(detail),
             )
-            raise HTTPException(status_code=r.status_code, detail=detail)
-        if isinstance(data, dict):
-            data.setdefault("provider", "openai")
-        return data
+            _raise_upstream_error(
+                provider="openai",
+                status_code=r.status_code,
+                message=f"Upstream OpenAI returned status {r.status_code}.",
+                body=detail,
+            )
+        if not isinstance(data, dict):
+            _raise_upstream_error(
+                provider="openai",
+                status_code=502,
+                message="OpenAI returned unexpected JSON root.",
+                body=data,
+            )
+        return _responses_to_chat_completion_shape(data, str(responses_payload["model"]))
 
     # Gemini
     api_key = resolve_gemini_api_key(redis_cfg)
@@ -470,7 +561,12 @@ async def upstream_chat_completion(
             )
         except httpx.RequestError as exc:
             logger.warning("upstream_gemini_request_error error=%s detail=%s", type(exc).__name__, exc)
-            raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
+            _raise_upstream_error(
+                provider="gemini",
+                status_code=502,
+                message="Upstream request failed.",
+                error=str(exc),
+            )
 
     ct = r.headers.get("content-type", "")
     logger.info("upstream_gemini_response status_code=%s content_type=%s", r.status_code, ct)
@@ -480,23 +576,36 @@ async def upstream_chat_completion(
             r.status_code,
             r.text[:500],
         )
-        raise HTTPException(
+        _raise_upstream_error(
+            provider="gemini",
             status_code=502,
-            detail=f"Gemini returned non-JSON ({r.status_code}): {r.text[:500]}",
+            message=f"Upstream returned non-JSON (status {r.status_code}).",
+            body=_response_body_or_text(r),
         )
     try:
         data = r.json()
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail="Gemini response was not valid JSON.") from exc
+        _raise_upstream_error(
+            provider="gemini",
+            status_code=502,
+            message="Upstream response was not valid JSON.",
+            body=_truncate_body(r.text),
+            error=str(exc),
+        )
 
     if r.is_error:
-        detail = data if isinstance(data, dict) else {"error": str(data)}
+        detail = data if isinstance(data, dict) else data
         logger.warning(
             "upstream_gemini_error status_code=%s detail=%s",
             r.status_code,
             _safe_detail(detail),
         )
-        raise HTTPException(status_code=r.status_code, detail=detail)
+        _raise_upstream_error(
+            provider="gemini",
+            status_code=r.status_code,
+            message=f"Upstream Gemini returned status {r.status_code}.",
+            body=detail,
+        )
 
     if not isinstance(data, dict):
         raise HTTPException(status_code=502, detail="Gemini returned unexpected JSON root.")

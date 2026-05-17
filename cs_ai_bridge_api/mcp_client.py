@@ -70,3 +70,33 @@ async def call_mcp_tools(
 
     logger.info("mcp_tool_calls_done request_id=%s count=%s", request_id, len(results))
     return results
+
+
+async def list_openai_function_tools(request_id: str) -> list[dict[str, Any]]:
+    """Read MCP tool definitions from local MCP server and convert for OpenAI Responses API."""
+    url = mcp_url()
+    timeout = mcp_timeout_seconds()
+    logger.info("mcp_list_tools_start request_id=%s url=%s", request_id, url)
+
+    async with Client(url, timeout=timeout) as client:
+        tools = await client.list_tools()
+
+    out: list[dict[str, Any]] = []
+    for tool in tools:
+        name = str(getattr(tool, "name", "")).strip()
+        if not name:
+            continue
+        input_schema = getattr(tool, "inputSchema", None) or {"type": "object", "properties": {}}
+        if not isinstance(input_schema, dict):
+            input_schema = {"type": "object", "properties": {}}
+        out.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": str(getattr(tool, "description", "") or ""),
+                "parameters": input_schema,
+            }
+        )
+
+    logger.info("mcp_list_tools_done request_id=%s count=%s", request_id, len(out))
+    return out

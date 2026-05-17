@@ -27,6 +27,26 @@ def _safe_detail(detail: Any) -> str:
     return str(detail).replace("\n", " ")[:1000]
 
 
+def _build_effective_mcp_calls(req: "ChatCompletionRequest") -> list[dict[str, Any]]:
+    calls = list(req.mcp_tool_calls or [])
+    schema_tenant = (req.schema_key or "").strip()
+    if not schema_tenant:
+        return calls
+
+    # Do not duplicate schema fetch if the caller already requested it.
+    for call in calls:
+        if str(call.get("name", "")).strip() == "get_schema_metadata":
+            return calls
+
+    calls.append(
+        {
+            "name": "get_schema_metadata",
+            "arguments": {"tenant": schema_tenant},
+        }
+    )
+    return calls
+
+
 class ChatCompletionRequest(BaseModel):
     """OpenAI-style chat body; ``tenant`` selects Redis config key when set.
 
@@ -110,9 +130,10 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
         },
     )
     mcp_results: list[dict[str, Any]] | None = None
-    if req.mcp_tool_calls:
+    effective_mcp_calls = _build_effective_mcp_calls(req)
+    if effective_mcp_calls:
         try:
-            mcp_results = await call_mcp_tools(req.mcp_tool_calls, request_id)
+            mcp_results = await call_mcp_tools(effective_mcp_calls, request_id)
         except ValueError as exc:
             logger.warning(
                 "mcp_tool_calls_invalid request_id=%s detail=%s",
@@ -159,6 +180,20 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
             _safe_detail(exc.detail),
         )
         raise
+    except Exception as exc:
+        logger.exception(
+            "chat_completion_unhandled request_id=%s error=%s detail=%s",
+            request_id,
+            type(exc).__name__,
+            _safe_detail(str(exc)),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Unhandled server error.",
+                "error": str(exc),
+            },
+        ) from exc
 
     logger.info(
         "chat_completion_success request_id=%s provider=%s model=%s",
