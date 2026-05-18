@@ -1,28 +1,27 @@
-# CS AI Bridge API project.
+# CS AI Bridge MCP project.
 #
-# Host URL: http://localhost:8072
+# Host URL: http://localhost:8071
+# Start this project when the AI API needs MCP tools.
 
-name: cs-ai-bridge-api
+name: cs-ai-bridge-mcp
 
 services:
-  cs-ai-bridge-api:
+  cs-ai-bridge-mcp:
     build:
       context: .
       dockerfile: Dockerfile
-    image: cs-ai-bridge-api:latest
-    container_name: cs-ai-bridge-api
+    image: cs-ai-bridge-mcp:latest
+    container_name: cs-ai-bridge-mcp
     restart: unless-stopped
     ports:
-      - "8072:8080"
+      - "8071:8000"
     env_file:
       - .env.example
       - path: .env
         required: false
-    environment:
-      CS_AI_BRIDGE_API_PORT: "8080"
     networks:
-      - cs-ai-bridge-api
+      - cs-ai-bridge-mcp
 
 networks:
-  cs-ai-bridge-api:
-    name: cs-ai-bridge-api
+  cs-ai-bridge-mcp:
+    name: cs-ai-bridge-mcp

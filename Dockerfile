@@ -1,11 +1,8 @@
-# FastAPI LLM proxy (OpenAI / Gemini from Redis) - port 8080
+# FastMCP (CS AI Bridge tools) - streamable HTTP on port 8000
 
 FROM python:3.11-slim
 
 WORKDIR /app
-
-ARG APP_BUILD_ID=strip-bridge-fields-v2
-ENV CS_AI_BRIDGE_API_BUILD_ID=${APP_BUILD_ID}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -15,8 +12,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY requirements.txt /app/
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-COPY cs_ai_bridge_api /app/cs_ai_bridge_api
+COPY cs_ai_bridge_mcp /app/cs_ai_bridge_mcp
 
-EXPOSE 8080
+EXPOSE 8000
 
-CMD ["uvicorn", "cs_ai_bridge_api.app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["fastmcp", "run", "cs_ai_bridge_mcp/server.py:mcp", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8000"]

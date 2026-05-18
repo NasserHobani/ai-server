@@ -1,8 +1,6 @@
-# FastAPI LLM proxy image only - see projects/api/Dockerfile
-fastapi
+# FastMCP service image only - see projects/mcp/Dockerfile
 fastmcp
 httpx
 pydantic
 python-dotenv
 redis
-uvicorn[standard]
