@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -90,6 +91,45 @@ def _truncate_body(value: Any, limit: int = 4000) -> Any:
     if isinstance(value, str):
         return value[:limit]
     return value
+
+
+def _log_json(label: str, payload: Any, *, max_len: int = 12000) -> None:
+    """Log a JSON-serializable payload (truncated) for debugging upstream LLM I/O."""
+    try:
+        raw = json.dumps(payload, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        raw = str(payload)
+    if len(raw) > max_len:
+        raw = f"{raw[:max_len]}...[truncated {len(raw) - max_len} chars]"
+    logger.info("%s %s", label, raw)
+
+
+def _extract_responses_output_text(data: dict[str, Any]) -> str:
+    """Aggregate assistant text from an OpenAI Responses API JSON body."""
+    top = data.get("output_text")
+    if isinstance(top, str) and top:
+        return top
+
+    texts: list[str] = []
+    output = data.get("output")
+    if not isinstance(output, list):
+        return ""
+
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "output_text" and isinstance(block.get("text"), str):
+                texts.append(block["text"])
+            elif block_type == "refusal" and isinstance(block.get("refusal"), str):
+                texts.append(block["refusal"])
+    return "".join(texts)
 
 
 def _response_body_or_text(response: httpx.Response) -> Any:
@@ -208,29 +248,63 @@ def _openai_responses_url(redis_cfg: dict[str, Any]) -> str:
     return f"{_normalize_base_url(raw.strip())}/responses"
 
 
-def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _messages_to_responses_input(
+    messages: list[dict[str, Any]],
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """Map chat messages to OpenAI Responses API ``input`` items.
+
+    Assistant history must use ``output_text`` blocks; user/developer use ``input_text``.
+    System prompts are returned separately as ``instructions``.
+    """
+    instructions_parts: list[str] = []
     out: list[dict[str, Any]] = []
     for msg in messages:
-        role = str(msg.get("role", "user"))
+        role = str(msg.get("role", "user")).strip().lower()
         text = _message_text(msg.get("content"))
+
+        if role == "system":
+            if text:
+                instructions_parts.append(text)
+            continue
+
+        if role == "assistant":
+            out_role = "assistant"
+            block_type = "output_text"
+        elif role == "tool":
+            out_role = "user"
+            block_type = "input_text"
+            if text:
+                text = f"[tool]\n{text}"
+        elif role in {"user", "developer"}:
+            out_role = role
+            block_type = "input_text"
+        else:
+            out_role = "user"
+            block_type = "input_text"
+            if text:
+                text = f"[{role}]\n{text}"
+
+        if not text and out_role != "assistant":
+            continue
+
         out.append(
             {
-                "role": role,
+                "role": out_role,
                 "content": [
                     {
-                        "type": "input_text",
+                        "type": block_type,
                         "text": text,
                     }
                 ],
             }
         )
-    return out
+
+    instructions = "\n\n".join(instructions_parts) if instructions_parts else None
+    return instructions, out
 
 
 def _responses_to_chat_completion_shape(data: dict[str, Any], model: str) -> dict[str, Any]:
-    text = ""
-    if isinstance(data.get("output_text"), str):
-        text = data["output_text"]
+    text = _extract_responses_output_text(data)
     created = int(time.time())
     usage_raw = data.get("usage")
     usage: dict[str, int] = {}
@@ -436,11 +510,19 @@ async def upstream_chat_completion(
         if not isinstance(messages, list) or not messages:
             raise HTTPException(status_code=400, detail="messages must be a non-empty list.")
         tools = await list_openai_function_tools(request_id=f"openai-{int(time.time())}")
+        instructions, responses_input = _messages_to_responses_input(messages)
+        if not responses_input:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one non-system user or assistant message is required.",
+            )
         responses_payload: dict[str, Any] = {
             "model": str(openai_payload.get("model", "")),
-            "input": _messages_to_responses_input(messages),
+            "input": responses_input,
             "tools": tools,
         }
+        if instructions:
+            responses_payload["instructions"] = instructions
         if openai_payload.get("temperature") is not None:
             responses_payload["temperature"] = openai_payload["temperature"]
         if openai_payload.get("max_tokens") is not None:
@@ -451,6 +533,7 @@ async def upstream_chat_completion(
             responses_payload.get("model"),
             ",".join(sorted(responses_payload.keys())),
         )
+        _log_json("upstream_openai_request_body", responses_payload)
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -516,7 +599,16 @@ async def upstream_chat_completion(
                 message="OpenAI returned unexpected JSON root.",
                 body=data,
             )
-        return _responses_to_chat_completion_shape(data, str(responses_payload["model"]))
+        _log_json("upstream_openai_response_body", data)
+        assistant_text = _extract_responses_output_text(data)
+        logger.info(
+            "upstream_openai_assistant_text len=%s preview=%s",
+            len(assistant_text),
+            _safe_detail(assistant_text[:500] if assistant_text else "<empty>"),
+        )
+        shaped = _responses_to_chat_completion_shape(data, str(responses_payload["model"]))
+        _log_json("upstream_openai_chat_completion", shaped)
+        return shaped
 
     # Gemini
     api_key = resolve_gemini_api_key(redis_cfg)
