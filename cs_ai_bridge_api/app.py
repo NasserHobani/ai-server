@@ -27,9 +27,26 @@ def _safe_detail(detail: Any) -> str:
     return str(detail).replace("\n", " ")[:1000]
 
 
+def _schema_key_prefix() -> str:
+    return os.getenv("CS_AI_BRIDGE_SCHEMA_KEY_PREFIX", "cs_ai_bridge:schema").rstrip(":")
+
+
+def _normalize_schema_tenant(value: str | None) -> str | None:
+    """Accept tenant id or full Redis key like cs_ai_bridge:schema:jhzly."""
+    token = (value or "").strip()
+    if not token:
+        return None
+    prefix = f"{_schema_key_prefix()}:"
+    if token.startswith(prefix):
+        token = token[len(prefix) :].strip()
+    return token or None
+
+
 def _build_effective_mcp_calls(req: "ChatCompletionRequest") -> list[dict[str, Any]]:
     calls = list(req.mcp_tool_calls or [])
-    schema_tenant = (req.schema_key or "").strip()
+    schema_tenant = _normalize_schema_tenant(req.tenant) or _normalize_schema_tenant(
+        req.schema_key
+    )
     if not schema_tenant:
         return calls
 
@@ -38,11 +55,12 @@ def _build_effective_mcp_calls(req: "ChatCompletionRequest") -> list[dict[str, A
         if str(call.get("name", "")).strip() == "get_schema_metadata":
             return calls
 
-    calls.append(
+    calls.insert(
+        0,
         {
             "name": "get_schema_metadata",
             "arguments": {"tenant": schema_tenant},
-        }
+        },
     )
     return calls
 
