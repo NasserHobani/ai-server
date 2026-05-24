@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import json
 import logging
 import os
 from typing import Any, AsyncIterator
@@ -11,7 +10,12 @@ import uuid
 
 from cs_ai_bridge_api.llm_config_redis import llm_api_key, read_ai_runtime_config, redis_url
 from cs_ai_bridge_api.llm_providers import merge_request_body, upstream_chat_completion
-from cs_ai_bridge_api.mcp_client import _jsonable, call_mcp_tools
+from cs_ai_bridge_api.mcp_client import call_mcp_tools
+from cs_ai_bridge_api.mcp_format import (
+    format_mcp_results_for_context,
+    normalize_chat_messages,
+    normalize_mcp_results_list,
+)
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -147,11 +151,15 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
             "schema_key",
         },
     )
+    if isinstance(body.get("messages"), list):
+        body["messages"] = normalize_chat_messages(body["messages"])
     mcp_results: list[dict[str, Any]] | None = None
     effective_mcp_calls = _build_effective_mcp_calls(req)
     if effective_mcp_calls:
         try:
-            mcp_results = await call_mcp_tools(effective_mcp_calls, request_id)
+            mcp_results = normalize_mcp_results_list(
+                await call_mcp_tools(effective_mcp_calls, request_id)
+            )
         except ValueError as exc:
             logger.warning(
                 "mcp_tool_calls_invalid request_id=%s detail=%s",
@@ -172,11 +180,7 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
             *body["messages"],
             {
                 "role": "system",
-                "content": (
-                    "MCP tool results for this request. Use this JSON as live business "
-                    "context when answering the user:\n"
-                    f"{json.dumps(_jsonable(mcp_results), ensure_ascii=False)}"
-                ),
+                "content": format_mcp_results_for_context(mcp_results),
             },
         ]
 

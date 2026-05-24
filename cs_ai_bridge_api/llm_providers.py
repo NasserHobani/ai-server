@@ -345,22 +345,9 @@ def _timeout_seconds(redis_cfg: dict[str, Any]) -> float:
 
 
 def _message_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict):
-                if block.get("type") == "text" and isinstance(block.get("text"), str):
-                    parts.append(block["text"])
-                elif isinstance(block.get("text"), str):
-                    parts.append(block["text"])
-            elif isinstance(block, str):
-                parts.append(block)
-        return "\n".join(parts) if parts else ""
-    if content is None:
-        return ""
-    return str(content)
+    from cs_ai_bridge_api.mcp_format import normalize_message_content
+
+    return normalize_message_content(content)
 
 
 def _messages_to_gemini(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:

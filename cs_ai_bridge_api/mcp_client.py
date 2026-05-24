@@ -6,6 +6,7 @@ import logging
 import os
 from typing import Any
 
+from cs_ai_bridge_api.mcp_format import unwrap_tool_payload
 from fastmcp import Client
 
 
@@ -26,18 +27,40 @@ def _jsonable(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return _jsonable(value.model_dump(mode="json"))
     if type(value).__name__ == "CallToolResult":
-        return {
+        raw = {
             "is_error": bool(getattr(value, "is_error", False)),
             "structured_content": _jsonable(getattr(value, "structured_content", None)),
             "data": _jsonable(getattr(value, "data", None)),
-            "content": _jsonable(getattr(value, "content", None)),
+            "content": _jsonable_content(getattr(value, "content", None)),
             "meta": _jsonable(getattr(value, "meta", None)),
         }
+        return unwrap_tool_payload(raw)
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_jsonable(v) for v in value]
+    if hasattr(value, "text") and isinstance(getattr(value, "text"), str):
+        return getattr(value, "text")
     return str(value)
+
+
+def _jsonable_content(content: Any) -> Any:
+    if isinstance(content, list):
+        blocks: list[Any] = []
+        for block in content:
+            if isinstance(block, dict):
+                blocks.append(block)
+            elif hasattr(block, "text"):
+                blocks.append(
+                    {
+                        "type": getattr(block, "type", "text"),
+                        "text": getattr(block, "text", ""),
+                    }
+                )
+            else:
+                blocks.append(_jsonable(block))
+        return blocks
+    return _jsonable(content)
 
 
 async def call_mcp_tools(
