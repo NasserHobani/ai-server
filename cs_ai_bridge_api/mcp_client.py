@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def mcp_url() -> str:
-    return os.getenv("CS_AI_BRIDGE_MCP_URL", "http://host.docker.internal:8071/mcp").strip()
+    return os.getenv("CS_AI_BRIDGE_MCP_URL", "http://cs-ai-bridge-mcp:8000/mcp").strip()
 
 
 def mcp_timeout_seconds() -> float:
@@ -21,13 +21,23 @@ def mcp_timeout_seconds() -> float:
 
 
 def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
     if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
+        return _jsonable(value.model_dump(mode="json"))
+    if type(value).__name__ == "CallToolResult":
+        return {
+            "is_error": bool(getattr(value, "is_error", False)),
+            "structured_content": _jsonable(getattr(value, "structured_content", None)),
+            "data": _jsonable(getattr(value, "data", None)),
+            "content": _jsonable(getattr(value, "content", None)),
+            "meta": _jsonable(getattr(value, "meta", None)),
+        }
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple, set)):
         return [_jsonable(v) for v in value]
-    return value
+    return str(value)
 
 
 async def call_mcp_tools(

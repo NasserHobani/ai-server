@@ -11,7 +11,7 @@ import uuid
 
 from cs_ai_bridge_api.llm_config_redis import llm_api_key, read_ai_runtime_config, redis_url
 from cs_ai_bridge_api.llm_providers import merge_request_body, upstream_chat_completion
-from cs_ai_bridge_api.mcp_client import call_mcp_tools
+from cs_ai_bridge_api.mcp_client import _jsonable, call_mcp_tools
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -175,7 +175,7 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
                 "content": (
                     "MCP tool results for this request. Use this JSON as live business "
                     "context when answering the user:\n"
-                    f"{json.dumps(mcp_results, ensure_ascii=False)}"
+                    f"{json.dumps(_jsonable(mcp_results), ensure_ascii=False)}"
                 ),
             },
         ]
