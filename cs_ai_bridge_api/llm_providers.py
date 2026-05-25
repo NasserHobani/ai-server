@@ -93,17 +93,6 @@ def _truncate_body(value: Any, limit: int = 4000) -> Any:
     return value
 
 
-def _log_json(label: str, payload: Any, *, max_len: int = 12000) -> None:
-    """Log a JSON-serializable payload (truncated) for debugging upstream LLM I/O."""
-    try:
-        raw = json.dumps(payload, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        raw = str(payload)
-    if len(raw) > max_len:
-        raw = f"{raw[:max_len]}...[truncated {len(raw) - max_len} chars]"
-    logger.info("%s %s", label, raw)
-
-
 def _extract_responses_output_text(data: dict[str, Any]) -> str:
     """Aggregate assistant text from an OpenAI Responses API JSON body."""
     top = data.get("output_text")
@@ -211,6 +200,7 @@ def prepare_openai_request_body(body: dict[str, Any]) -> dict[str, Any]:
         logger.info("openai_request_fields_removed keys=%s", ",".join(sorted(removed)))
     # User requested never forwarding metadata to AI.
     payload.pop("metadata", None)
+    payload.pop("_mcp_prefetched", None)
     for key in list(payload.keys()):
         if key.startswith("metadata."):
             payload.pop(key, None)
@@ -304,7 +294,9 @@ def _messages_to_responses_input(
 
 
 def _responses_to_chat_completion_shape(data: dict[str, Any], model: str) -> dict[str, Any]:
-    text = _extract_responses_output_text(data)
+    from cs_ai_bridge_api.mcp_format import ensure_assistant_text
+
+    text = ensure_assistant_text(_extract_responses_output_text(data))
     created = int(time.time())
     usage_raw = data.get("usage")
     usage: dict[str, int] = {}
@@ -496,7 +488,15 @@ async def upstream_chat_completion(
         messages = openai_payload.get("messages")
         if not isinstance(messages, list) or not messages:
             raise HTTPException(status_code=400, detail="messages must be a non-empty list.")
-        tools = await list_openai_function_tools(request_id=f"openai-{int(time.time())}")
+        include_mcp_tools = os.getenv("CS_AI_BRIDGE_OPENAI_INCLUDE_MCP_TOOLS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if include_mcp_tools and merged_body.get("_mcp_prefetched") is not True:
+            tools = await list_openai_function_tools(request_id=f"openai-{int(time.time())}")
+        else:
+            tools = []
         instructions, responses_input = _messages_to_responses_input(messages)
         if not responses_input:
             raise HTTPException(
@@ -506,8 +506,9 @@ async def upstream_chat_completion(
         responses_payload: dict[str, Any] = {
             "model": str(openai_payload.get("model", "")),
             "input": responses_input,
-            "tools": tools,
         }
+        if tools:
+            responses_payload["tools"] = tools
         if instructions:
             responses_payload["instructions"] = instructions
         if openai_payload.get("temperature") is not None:
@@ -515,12 +516,12 @@ async def upstream_chat_completion(
         if openai_payload.get("max_tokens") is not None:
             responses_payload["max_output_tokens"] = openai_payload["max_tokens"]
         logger.info(
-            "upstream_openai_request url=%s model=%s payload_keys=%s",
+            "upstream_openai_request url=%s model=%s input_items=%s tools=%s",
             url,
             responses_payload.get("model"),
-            ",".join(sorted(responses_payload.keys())),
+            len(responses_input),
+            len(tools),
         )
-        _log_json("upstream_openai_request_body", responses_payload)
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -586,7 +587,6 @@ async def upstream_chat_completion(
                 message="OpenAI returned unexpected JSON root.",
                 body=data,
             )
-        _log_json("upstream_openai_response_body", data)
         assistant_text = _extract_responses_output_text(data)
         logger.info(
             "upstream_openai_assistant_text len=%s preview=%s",
@@ -594,7 +594,6 @@ async def upstream_chat_completion(
             _safe_detail(assistant_text[:500] if assistant_text else "<empty>"),
         )
         shaped = _responses_to_chat_completion_shape(data, str(responses_payload["model"]))
-        _log_json("upstream_openai_chat_completion", shaped)
         return shaped
 
     # Gemini

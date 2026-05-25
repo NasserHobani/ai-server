@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+_SCHEMA_TOOL = "get_schema_metadata"
+
 
 def normalize_message_content(content: Any) -> str:
     """Turn message ``content`` into plain text (never leave opaque objects)."""
@@ -28,6 +30,8 @@ def normalize_message_content(content: Any) -> str:
                 parts.append(field_to_display(block))
         return "\n".join(parts) if parts else ""
     if isinstance(content, dict):
+        if "content" in content and "role" in content:
+            return normalize_message_content(content.get("content"))
         return json.dumps(content, ensure_ascii=False, indent=2)
     return field_to_display(content)
 
@@ -57,7 +61,8 @@ def field_to_display(value: Any) -> str:
             return str(name)
         if record_id is not None and len(value) <= 2:
             return f"id {record_id}"
-        return json.dumps(value, ensure_ascii=False)
+        flat = {str(k): field_to_display(v) for k, v in value.items()}
+        return json.dumps(flat, ensure_ascii=False)
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
@@ -73,6 +78,10 @@ def normalize_business_payload(value: Any) -> Any:
         if "error" in value and "result" not in value:
             return value
 
+        records = _records_from_payload(value)
+        if records is not None:
+            return {"records": records}
+
         out: dict[str, Any] = {}
         for key, val in value.items():
             if key == "records" and isinstance(val, list):
@@ -85,6 +94,8 @@ def normalize_business_payload(value: Any) -> Any:
         return out
 
     if isinstance(value, list):
+        if value and all(isinstance(row, dict) for row in value):
+            return {"records": [normalize_record(row) for row in value]}
         return [normalize_field_value(item) for item in value]
     return normalize_field_value(value)
 
@@ -92,14 +103,11 @@ def normalize_business_payload(value: Any) -> Any:
 def normalize_field_value(value: Any) -> Any:
     if isinstance(value, dict):
         if "display_name" in value or ("id" in value and "name" in value):
-            return {
-                "id": value.get("id"),
-                "name": value.get("display_name") or value.get("name"),
-            }
+            return field_to_display(value)
         return {str(k): normalize_field_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         if len(value) == 2 and isinstance(value[0], int) and isinstance(value[1], str):
-            return {"id": value[0], "name": value[1]}
+            return field_to_display(value)
         return [normalize_field_value(v) for v in value]
     return value
 
@@ -156,47 +164,76 @@ def _maybe_parse_json(text: str) -> Any | None:
         return None
 
 
+def _looks_like_record(row: Any) -> bool:
+    return isinstance(row, dict) and bool(row) and "id" in row
+
+
 def _records_from_payload(payload: Any) -> list[dict[str, str]] | None:
+    if isinstance(payload, list):
+        if payload and all(_looks_like_record(row) for row in payload):
+            return [normalize_record(row) for row in payload]
+        return None
     if not isinstance(payload, dict):
         return None
-    for key in ("records", "data", "result"):
+
+    for key in ("records", "data", "result", "rows", "items"):
         candidate = payload.get(key)
         if isinstance(candidate, list) and candidate and isinstance(candidate[0], dict):
             return [normalize_record(row) for row in candidate]
+        if isinstance(candidate, dict):
+            nested = _records_from_payload(candidate)
+            if nested:
+                return nested
     return None
 
 
-def format_payload_markdown(tool_name: str, payload: Any) -> str:
-    lines = [f"### MCP tool `{tool_name}`"]
-    records = _records_from_payload(payload) if isinstance(payload, dict) else None
+def format_payload_content(payload: Any) -> str:
+    """Format business payload as plain text (no tool names or JSON wrappers)."""
+    records = _records_from_payload(payload) if payload is not None else None
     if records:
-        headers = sorted({key for row in records for key in row.keys()})
-        lines.append("| " + " | ".join(headers) + " |")
-        lines.append("| " + " | ".join("---" for _ in headers) + " |")
-        for row in records:
-            lines.append("| " + " | ".join(row.get(h, "") for h in headers) + " |")
-        return "\n".join(lines)
+        blocks: list[str] = []
+        for index, row in enumerate(records, start=1):
+            lines = [f"Record {index}:"]
+            for key in sorted(row.keys()):
+                value = row.get(key, "")
+                if value:
+                    lines.append(f"- {key}: {value}")
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
 
     if isinstance(payload, dict):
-        lines.append("```json")
-        lines.append(json.dumps(payload, ensure_ascii=False, indent=2))
-        lines.append("```")
-    else:
-        lines.append(str(payload))
-    return "\n".join(lines)
+        lines = [f"- {key}: {field_to_display(val)}" for key, val in sorted(payload.items())]
+        return "\n".join(lines)
+    if payload is None:
+        return ""
+    return field_to_display(payload)
 
 
 def format_mcp_results_for_context(mcp_results: list[dict[str, Any]]) -> str:
-    sections: list[str] = [
-        "Live Odoo/MCP data for this request. Present customers and related records "
-        "using the field labels below as a markdown table or bullet list. "
-        "Never output the literal text [object Object]; always use id/name strings "
-        "from the data.",
-    ]
+    """Plain business data only — no tool names, no schema dump."""
+    sections: list[str] = []
     for entry in mcp_results:
-        name = str(entry.get("name", "tool"))
+        if str(entry.get("name", "")).strip() == _SCHEMA_TOOL:
+            continue
         payload = entry.get("result")
-        sections.append(format_payload_markdown(name, payload))
+        formatted = format_payload_content(payload)
+        if formatted.strip():
+            sections.append(formatted)
+    return "\n\n".join(sections)
+
+
+def format_mcp_results_plain(mcp_results: list[dict[str, Any]]) -> str:
+    """Human-readable fallback answer built from MCP query results."""
+    sections: list[str] = []
+    for entry in mcp_results:
+        if str(entry.get("name", "")).strip() == _SCHEMA_TOOL:
+            continue
+        payload = entry.get("result")
+        formatted = format_payload_content(payload)
+        if formatted.strip():
+            sections.append(formatted)
+    if not sections:
+        return "No matching records were found."
     return "\n\n".join(sections)
 
 
@@ -225,3 +262,12 @@ def normalize_chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, An
             copy["content"] = normalize_message_content(copy.get("content"))
         normalized.append(copy)
     return normalized
+
+
+def ensure_assistant_text(content: Any) -> str:
+    text = normalize_message_content(content)
+    if text.strip() in {"", "[object Object]"}:
+        return ""
+    if "[object Object]" in text:
+        return text.replace("[object Object]", "").strip()
+    return text

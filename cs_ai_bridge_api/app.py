@@ -12,7 +12,9 @@ from cs_ai_bridge_api.llm_config_redis import llm_api_key, read_ai_runtime_confi
 from cs_ai_bridge_api.llm_providers import merge_request_body, upstream_chat_completion
 from cs_ai_bridge_api.mcp_client import call_mcp_tools
 from cs_ai_bridge_api.mcp_format import (
+    ensure_assistant_text,
     format_mcp_results_for_context,
+    format_mcp_results_plain,
     normalize_chat_messages,
     normalize_mcp_results_list,
 )
@@ -176,13 +178,16 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
             )
             raise HTTPException(status_code=502, detail=f"MCP tool call failed: {exc}") from exc
 
-        body["messages"] = [
-            *body["messages"],
-            {
-                "role": "system",
-                "content": format_mcp_results_for_context(mcp_results),
-            },
-        ]
+        mcp_context = format_mcp_results_for_context(mcp_results)
+        if mcp_context.strip():
+            body["messages"] = [
+                *body["messages"],
+                {
+                    "role": "system",
+                    "content": mcp_context,
+                },
+            ]
+        body["_mcp_prefetched"] = True
 
     merged = merge_request_body(body, redis_cfg)
     logger.info(
@@ -223,6 +228,36 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
         result.get("provider", redis_cfg.get("provider", "openai")),
         result.get("model", merged.get("model")),
     )
+
+    choices = result.get("choices")
+    message = choices[0].get("message") if isinstance(choices, list) and choices else {}
+    if not isinstance(message, dict):
+        message = {}
+    content = ensure_assistant_text(message.get("content"))
+    if mcp_results is not None:
+        mcp_text = format_mcp_results_plain(mcp_results)
+        result["mcp_results_text"] = mcp_text
+        if not content:
+            content = mcp_text
+            result["answer_source"] = "mcp_fallback"
+        elif "[object Object]" in content:
+            content = mcp_text
+            result["answer_source"] = "mcp_fallback"
+    elif not content and "[object Object]" in ensure_assistant_text(message.get("content")):
+        content = ""
+
+    if isinstance(choices, list) and choices:
+        choices[0]["message"] = {"role": "assistant", "content": content}
+    else:
+        result["choices"] = [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ]
+    result["content"] = content
+
     if mcp_results is not None:
         result["mcp_results"] = mcp_results
     return result
