@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,7 +20,7 @@ from cs_ai_bridge_api.openai_responses import (
     messages_to_responses_input,
     to_chat_completion_shape,
 )
-from cs_ai_bridge_api.schema_redis import normalize_tenant, read_schema_metadata
+from cs_ai_bridge_api.schema_redis import normalize_tenant
 from cs_ai_bridge_api.schema_validate import validate_tool_call
 
 
@@ -45,11 +47,40 @@ def max_tool_rounds() -> int:
     return max(1, min(value, 32))
 
 
-def load_tenant_schema(tenant: str | None) -> dict[str, Any]:
+def max_upstream_retries() -> int:
+    try:
+        value = int(os.getenv("CS_AI_BRIDGE_OPENAI_RETRY_MAX_ATTEMPTS", "2"))
+    except ValueError:
+        value = 2
+    return max(0, min(value, 5))
+
+
+def upstream_retry_backoff_seconds() -> float:
+    try:
+        value = float(os.getenv("CS_AI_BRIDGE_OPENAI_RETRY_BACKOFF_SECONDS", "1.5"))
+    except ValueError:
+        value = 1.5
+    return max(0.0, min(value, 30.0))
+
+
+def _coerce_schema_payload(value: Any, tenant: str) -> dict[str, Any]:
+    if isinstance(value, dict) and isinstance(value.get("models"), dict):
+        return value
+    raise ValueError(
+        f"MCP get_schema_metadata returned invalid schema payload for tenant '{tenant}'."
+    )
+
+
+async def load_tenant_schema(tenant: str | None, request_id: str) -> dict[str, Any]:
     normalized = normalize_tenant(tenant)
     if not normalized:
         raise ValueError("Tenant is required for MCP orchestration.")
-    return read_schema_metadata(normalized)
+    result = await call_mcp_tool(
+        "get_schema_metadata",
+        {"tenant": normalized},
+        request_id,
+    )
+    return _coerce_schema_payload(result, normalized)
 
 
 def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
@@ -166,41 +197,118 @@ def _append_tool_results_to_conversation(
         )
 
 
+def _maybe_extract_openai_request_id(response: httpx.Response, data: Any) -> str | None:
+    header_id = response.headers.get("x-request-id")
+    if isinstance(header_id, str) and header_id.strip():
+        return header_id.strip()
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    if not isinstance(error, dict):
+        return None
+    message = error.get("message")
+    if not isinstance(message, str):
+        return None
+    match = re.search(r"(req_[a-zA-Z0-9]+)", message)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _is_retryable_openai_status(status_code: int) -> bool:
+    return status_code == 429 or status_code >= 500
+
+
+def openai_request_log_max_chars() -> int:
+    try:
+        value = int(os.getenv("CS_AI_BRIDGE_OPENAI_REQUEST_LOG_MAX_CHARS", "20000"))
+    except ValueError:
+        value = 20000
+    return max(1000, min(value, 200000))
+
+
+def _serialize_payload_for_log(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(payload, ensure_ascii=False, default=str)
+    max_chars = openai_request_log_max_chars()
+    if len(serialized) <= max_chars:
+        return serialized
+    return serialized[:max_chars] + "...<truncated>"
+
+
 async def _post_responses(
     client: httpx.AsyncClient,
     *,
     url: str,
     headers: dict[str, str],
     payload: dict[str, Any],
+    request_id: str,
 ) -> dict[str, Any]:
-    response = await client.post(url, json=payload, headers=headers)
-    if "application/json" not in response.headers.get("content-type", ""):
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "provider": "openai",
-                "message": f"Upstream returned non-JSON (status {response.status_code}).",
-                "body": response.text[:4000],
-            },
+    retry_max = max_upstream_retries()
+    backoff = upstream_retry_backoff_seconds()
+
+    for attempt in range(retry_max + 1):
+        logger.info(
+            "openai_responses_request request_id=%s attempt=%s/%s payload=%s",
+            request_id,
+            attempt + 1,
+            retry_max + 1,
+            _serialize_payload_for_log(payload),
         )
-    data = response.json()
-    if response.is_error:
-        logger.warning(
-            "openai_responses_error status=%s body=%s",
-            response.status_code,
-            json.dumps(data, ensure_ascii=False)[:2000],
-        )
-        raise HTTPException(
-            status_code=response.status_code,
-            detail={
-                "provider": "openai",
-                "message": f"Upstream OpenAI returned status {response.status_code}.",
-                "body": data,
-            },
-        )
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=502, detail="OpenAI returned unexpected JSON root.")
-    return data
+        response = await client.post(url, json=payload, headers=headers)
+        is_last_attempt = attempt >= retry_max
+        content_type = response.headers.get("content-type", "")
+        data: Any = None
+
+        if "application/json" in content_type:
+            data = response.json()
+        else:
+            if _is_retryable_openai_status(response.status_code) and not is_last_attempt:
+                logger.warning(
+                    "openai_responses_retry_non_json status=%s attempt=%s/%s",
+                    response.status_code,
+                    attempt + 1,
+                    retry_max + 1,
+                )
+                if backoff > 0:
+                    await asyncio.sleep(backoff * (attempt + 1))
+                continue
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "provider": "openai",
+                    "message": f"Upstream returned non-JSON (status {response.status_code}).",
+                    "body": response.text[:4000],
+                },
+            )
+
+        if response.is_error:
+            openai_request_id = _maybe_extract_openai_request_id(response, data)
+            log_suffix = f" openai_request_id={openai_request_id}" if openai_request_id else ""
+            logger.warning(
+                "openai_responses_error status=%s attempt=%s/%s%s body=%s",
+                response.status_code,
+                attempt + 1,
+                retry_max + 1,
+                log_suffix,
+                json.dumps(data, ensure_ascii=False)[:2000],
+            )
+            if _is_retryable_openai_status(response.status_code) and not is_last_attempt:
+                if backoff > 0:
+                    await asyncio.sleep(backoff * (attempt + 1))
+                continue
+            raise HTTPException(
+                status_code=response.status_code,
+                detail={
+                    "provider": "openai",
+                    "message": f"Upstream OpenAI returned status {response.status_code}.",
+                    "body": data,
+                },
+            )
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=502, detail="OpenAI returned unexpected JSON root.")
+        return data
+
+    raise HTTPException(status_code=502, detail="OpenAI request retries exhausted unexpectedly.")
 
 
 async def run_openai_responses_with_mcp(
@@ -215,7 +323,7 @@ async def run_openai_responses_with_mcp(
     temperature: float | None = None,
     max_output_tokens: int | None = None,
 ) -> OrchestratorRun:
-    schema = load_tenant_schema(tenant)
+    schema = await load_tenant_schema(tenant, request_id)
     tools = await build_openai_function_tools(request_id, schema)
 
     instructions, input_items = messages_to_responses_input(messages)
@@ -259,7 +367,13 @@ async def run_openai_responses_with_mcp(
                 len(conversation_input),
             )
 
-            last_response = await _post_responses(client, url=url, headers=headers, payload=payload)
+            last_response = await _post_responses(
+                client,
+                url=url,
+                headers=headers,
+                payload=payload,
+                request_id=request_id,
+            )
 
             function_calls = extract_function_calls(last_response)
             if not function_calls:

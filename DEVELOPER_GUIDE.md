@@ -9,8 +9,8 @@ Odoo Client
   → POST /v1/chat/completions
   → app.py (FastAPI)
   → llm_providers.py
-       ├─ [tenant + orchestrator] mcp_orchestrator.py
-       │     ├─ schema_redis.py (load schema)
+      ├─ [tenant + orchestrator] mcp_orchestrator.py
+      │     ├─ get_schema_metadata via MCP (schema source)
        │     ├─ mcp_tools.py (MCP → OpenAI function tools)
        │     ├─ openai_responses.py (message mapping)
        │     ├─ OpenAI /v1/responses (store: false)
@@ -97,7 +97,7 @@ If the client sends `mcp_tool_calls`, the gateway runs those tools first, inject
 |----------|-------------|
 | `orchestrator_enabled()` | Env `CS_AI_BRIDGE_MCP_ORCHESTRATOR` (default true) |
 | `max_tool_rounds()` | Max tool loop iterations (default 8) |
-| `load_tenant_schema(tenant)` | Redis schema load |
+| `load_tenant_schema(tenant, request_id)` | Schema load via MCP `get_schema_metadata` |
 | `execute_validated_mcp_tool(...)` | Validate + `call_mcp_tool` |
 | `run_openai_responses_with_mcp(...)` | Full async tool loop |
 

@@ -101,6 +101,14 @@ def _writable_fields(meta: dict[str, Any]) -> list[str]:
     return sorted(out)
 
 
+def _required_writable_create_fields(meta: dict[str, Any]) -> list[str]:
+    required = _required_create_fields(meta)
+    writable = set(_writable_fields(meta))
+    if not writable:
+        return required
+    return [name for name in required if name in writable]
+
+
 def _writable_fields_hint(meta: dict[str, Any], *, max_fields: int = 20) -> str:
     writable = _writable_fields(meta)
     if not writable:
@@ -205,7 +213,7 @@ def validate_mcp_create(
                 + _writable_fields_hint(meta)
             )
 
-    missing = [name for name in _required_create_fields(meta) if name not in vals]
+    missing = [name for name in _required_writable_create_fields(meta) if name not in vals]
     if missing:
         raise ValueError(
             f"Missing required fields for create on '{model}': {sorted(missing)}"
