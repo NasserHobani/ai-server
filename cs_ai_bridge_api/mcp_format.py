@@ -209,9 +209,28 @@ def format_payload_content(payload: Any) -> str:
     return field_to_display(payload)
 
 
-def format_mcp_results_for_context(mcp_results: list[dict[str, Any]]) -> str:
-    """Plain business data only — no tool names, no schema dump."""
-    sections: list[str] = []
+def format_mcp_results_for_context(
+    mcp_results: list[dict[str, Any]],
+    *,
+    schema_summary: str = "",
+) -> str:
+    """Plain business data for the LLM (records + optional schema summary)."""
+    from cs_ai_bridge_api.mcp_intent import format_schema_summary, schema_from_mcp_results
+
+    sections: list[str] = [
+        "You have live Odoo ERP data below. Answer the user using these records. "
+        "Do not refuse listing customers, contacts, invoices, or other business data "
+        "when records are attached.",
+    ]
+    if schema_summary.strip():
+        sections.append(schema_summary.strip())
+    else:
+        schema = schema_from_mcp_results(mcp_results)
+        if schema:
+            summary = format_schema_summary(schema)
+            if summary.strip():
+                sections.append(summary)
+
     for entry in mcp_results:
         if str(entry.get("name", "")).strip() == _SCHEMA_TOOL:
             continue

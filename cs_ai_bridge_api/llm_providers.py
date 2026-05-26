@@ -11,7 +11,6 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from cs_ai_bridge_api.mcp_client import list_openai_function_tools
 from fastapi import HTTPException
 
 
@@ -201,6 +200,7 @@ def prepare_openai_request_body(body: dict[str, Any]) -> dict[str, Any]:
     # User requested never forwarding metadata to AI.
     payload.pop("metadata", None)
     payload.pop("_mcp_prefetched", None)
+    payload.pop("store", None)
     for key in list(payload.keys()):
         if key.startswith("metadata."):
             payload.pop(key, None)
@@ -460,6 +460,10 @@ async def upstream_chat_completion(
     redis_cfg: dict[str, Any],
     merged_body: dict[str, Any],
     env_openai_key: str | None,
+    *,
+    request_id: str | None = None,
+    tenant: str | None = None,
+    use_mcp_orchestrator: bool = False,
 ) -> dict[str, Any]:
     """``merged_body`` is OpenAI-shaped (after merge, before provider branch)."""
     provider = normalize_provider(redis_cfg)
@@ -488,40 +492,8 @@ async def upstream_chat_completion(
         messages = openai_payload.get("messages")
         if not isinstance(messages, list) or not messages:
             raise HTTPException(status_code=400, detail="messages must be a non-empty list.")
-        include_mcp_tools = os.getenv("CS_AI_BRIDGE_OPENAI_INCLUDE_MCP_TOOLS", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        if include_mcp_tools and merged_body.get("_mcp_prefetched") is not True:
-            tools = await list_openai_function_tools(request_id=f"openai-{int(time.time())}")
-        else:
-            tools = []
-        instructions, responses_input = _messages_to_responses_input(messages)
-        if not responses_input:
-            raise HTTPException(
-                status_code=400,
-                detail="At least one non-system user or assistant message is required.",
-            )
-        responses_payload: dict[str, Any] = {
-            "model": str(openai_payload.get("model", "")),
-            "input": responses_input,
-        }
-        if tools:
-            responses_payload["tools"] = tools
-        if instructions:
-            responses_payload["instructions"] = instructions
-        if openai_payload.get("temperature") is not None:
-            responses_payload["temperature"] = openai_payload["temperature"]
-        if openai_payload.get("max_tokens") is not None:
-            responses_payload["max_output_tokens"] = openai_payload["max_tokens"]
-        logger.info(
-            "upstream_openai_request url=%s model=%s input_items=%s tools=%s",
-            url,
-            responses_payload.get("model"),
-            len(responses_input),
-            len(tools),
-        )
+
+        rid = request_id or f"openai-{int(time.time())}"
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -530,6 +502,56 @@ async def upstream_chat_completion(
         if isinstance(extra_headers, dict):
             for hk, hv in extra_headers.items():
                 headers[str(hk)] = str(hv)
+
+        model = str(openai_payload.get("model", ""))
+        temperature = openai_payload.get("temperature")
+        max_out = openai_payload.get("max_tokens")
+
+        if use_mcp_orchestrator and tenant:
+            from cs_ai_bridge_api.mcp_orchestrator import run_openai_responses_with_mcp
+
+            logger.info(
+                "upstream_openai_orchestrator request_id=%s tenant=%s model=%s",
+                rid,
+                tenant,
+                model,
+            )
+            run = await run_openai_responses_with_mcp(
+                url=url,
+                headers=headers,
+                model=model,
+                messages=messages,
+                tenant=tenant,
+                request_id=rid,
+                timeout=timeout,
+                temperature=float(temperature) if isinstance(temperature, (int, float)) else None,
+                max_output_tokens=int(max_out) if isinstance(max_out, int) else None,
+            )
+            return run.response
+
+        instructions, responses_input = _messages_to_responses_input(messages)
+        if not responses_input:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one non-system user or assistant message is required.",
+            )
+        responses_payload: dict[str, Any] = {
+            "model": model,
+            "input": responses_input,
+            "store": False,
+        }
+        if instructions:
+            responses_payload["instructions"] = instructions
+        if temperature is not None:
+            responses_payload["temperature"] = temperature
+        if max_out is not None:
+            responses_payload["max_output_tokens"] = max_out
+        logger.info(
+            "upstream_openai_request url=%s model=%s input_items=%s orchestrator=false",
+            url,
+            model,
+            len(responses_input),
+        )
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             try:
@@ -593,8 +615,7 @@ async def upstream_chat_completion(
             len(assistant_text),
             _safe_detail(assistant_text[:500] if assistant_text else "<empty>"),
         )
-        shaped = _responses_to_chat_completion_shape(data, str(responses_payload["model"]))
-        return shaped
+        return _responses_to_chat_completion_shape(data, model)
 
     # Gemini
     api_key = resolve_gemini_api_key(redis_cfg)

@@ -18,6 +18,13 @@ from cs_ai_bridge_api.mcp_format import (
     normalize_chat_messages,
     normalize_mcp_results_list,
 )
+from cs_ai_bridge_api.mcp_intent import (
+    has_query_tool_call,
+    infer_mcp_queries,
+    last_user_message_text,
+    schema_from_mcp_results,
+)
+from cs_ai_bridge_api.mcp_orchestrator import orchestrator_enabled
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -48,7 +55,10 @@ def _normalize_schema_tenant(value: str | None) -> str | None:
     return token or None
 
 
-def _build_effective_mcp_calls(req: "ChatCompletionRequest") -> list[dict[str, Any]]:
+def _build_effective_mcp_calls(
+    req: "ChatCompletionRequest",
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     calls = list(req.mcp_tool_calls or [])
     schema_tenant = _normalize_schema_tenant(req.tenant) or _normalize_schema_tenant(
         req.schema_key
@@ -56,19 +66,53 @@ def _build_effective_mcp_calls(req: "ChatCompletionRequest") -> list[dict[str, A
     if not schema_tenant:
         return calls
 
-    # Do not duplicate schema fetch if the caller already requested it.
-    for call in calls:
-        if str(call.get("name", "")).strip() == "get_schema_metadata":
-            return calls
-
-    calls.insert(
-        0,
-        {
-            "name": "get_schema_metadata",
-            "arguments": {"tenant": schema_tenant},
-        },
-    )
+    if not any(str(call.get("name", "")).strip() == "get_schema_metadata" for call in calls):
+        calls.insert(
+            0,
+            {
+                "name": "get_schema_metadata",
+                "arguments": {"tenant": schema_tenant},
+            },
+        )
     return calls
+
+
+async def _resolve_mcp_calls_with_data(
+    req: "ChatCompletionRequest",
+    messages: list[dict[str, Any]],
+    request_id: str,
+) -> list[dict[str, Any]]:
+    """Fetch schema, infer ``mcp_query`` from user text, then run all MCP tools."""
+    calls = _build_effective_mcp_calls(req, messages)
+    if not calls:
+        return []
+
+    schema_tenant = _normalize_schema_tenant(req.tenant) or _normalize_schema_tenant(
+        req.schema_key
+    )
+    if not schema_tenant or has_query_tool_call(calls):
+        return normalize_mcp_results_list(await call_mcp_tools(calls, request_id))
+
+    # Phase 1: schema only (needed to pick model/fields for auto-query).
+    schema_calls = [c for c in calls if str(c.get("name", "")).strip() == "get_schema_metadata"]
+    other_calls = [c for c in calls if str(c.get("name", "")).strip() != "get_schema_metadata"]
+    schema_results = normalize_mcp_results_list(await call_mcp_tools(schema_calls, request_id))
+
+    auto_query = os.getenv("CS_AI_BRIDGE_AUTO_MCP_QUERY", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+    schema = schema_from_mcp_results(schema_results)
+    user_text = last_user_message_text(messages)
+    inferred = infer_mcp_queries(user_text, schema or {}, schema_tenant) if auto_query else []
+    if not inferred:
+        return schema_results
+
+    query_results = normalize_mcp_results_list(
+        await call_mcp_tools(inferred, request_id)
+    )
+    return schema_results + query_results
 
 
 class ChatCompletionRequest(BaseModel):
@@ -111,7 +155,7 @@ app = FastAPI(
 def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "build": os.getenv("CS_AI_BRIDGE_API_BUILD_ID", "strip-bridge-fields-v2"),
+        "build": os.getenv("CS_AI_BRIDGE_API_BUILD_ID", "mcp-orchestrator-v1"),
     }
 
 
@@ -125,11 +169,14 @@ def ready() -> dict[str, str]:
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
     request_id = uuid.uuid4().hex[:12]
+    schema_tenant = _normalize_schema_tenant(req.tenant) or _normalize_schema_tenant(
+        req.schema_key
+    )
     logger.info(
-        "chat_completion_request request_id=%s provider=%s tenant_set=%s messages=%s",
+        "chat_completion_request request_id=%s provider=%s tenant=%s messages=%s",
         request_id,
         req.provider or "<auto>",
-        bool(req.tenant),
+        schema_tenant or "<none>",
         len(req.messages),
     )
 
@@ -155,12 +202,21 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
     )
     if isinstance(body.get("messages"), list):
         body["messages"] = normalize_chat_messages(body["messages"])
+
+    use_orchestrator = (
+        orchestrator_enabled()
+        and bool(schema_tenant)
+        and not req.mcp_tool_calls
+    )
+
     mcp_results: list[dict[str, Any]] | None = None
-    effective_mcp_calls = _build_effective_mcp_calls(req)
-    if effective_mcp_calls:
+    effective_mcp_calls = _build_effective_mcp_calls(req, body.get("messages") or [])
+    if effective_mcp_calls and not use_orchestrator:
         try:
-            mcp_results = normalize_mcp_results_list(
-                await call_mcp_tools(effective_mcp_calls, request_id)
+            mcp_results = await _resolve_mcp_calls_with_data(
+                req,
+                body.get("messages") or [],
+                request_id,
             )
         except ValueError as exc:
             logger.warning(
@@ -179,6 +235,11 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
             raise HTTPException(status_code=502, detail=f"MCP tool call failed: {exc}") from exc
 
         mcp_context = format_mcp_results_for_context(mcp_results)
+        if mcp_context.strip() and "Record 1:" not in mcp_context:
+            logger.warning(
+                "mcp_context_no_records request_id=%s hint=check_schema_or_odoo_query",
+                request_id,
+            )
         if mcp_context.strip():
             body["messages"] = [
                 *body["messages"],
@@ -198,7 +259,14 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
         merged.get("model"),
     )
     try:
-        result = await upstream_chat_completion(redis_cfg, merged, llm_api_key())
+        result = await upstream_chat_completion(
+            redis_cfg,
+            merged,
+            llm_api_key(),
+            request_id=request_id,
+            tenant=schema_tenant,
+            use_mcp_orchestrator=use_orchestrator,
+        )
     except HTTPException as exc:
         logger.warning(
             "chat_completion_failed request_id=%s status_code=%s detail=%s",
@@ -260,4 +328,6 @@ async def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
 
     if mcp_results is not None:
         result["mcp_results"] = mcp_results
+    if use_orchestrator and result.get("mcp_tool_executions") is not None:
+        result["mcp_results"] = result.get("mcp_tool_executions")
     return result

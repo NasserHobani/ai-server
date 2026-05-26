@@ -105,8 +105,8 @@ async def call_mcp_tools(
     return results
 
 
-async def list_openai_function_tools(request_id: str) -> list[dict[str, Any]]:
-    """Read MCP tool definitions from local MCP server and convert for OpenAI Responses API."""
+async def list_mcp_tool_definitions(request_id: str) -> list[dict[str, Any]]:
+    """List raw MCP tool definitions from the MCP server."""
     url = mcp_url()
     timeout = mcp_timeout_seconds()
     logger.info("mcp_list_tools_start request_id=%s url=%s", request_id, url)
@@ -124,12 +124,29 @@ async def list_openai_function_tools(request_id: str) -> list[dict[str, Any]]:
             input_schema = {"type": "object", "properties": {}}
         out.append(
             {
-                "type": "function",
                 "name": name,
                 "description": str(getattr(tool, "description", "") or ""),
-                "parameters": input_schema,
+                "inputSchema": input_schema,
             }
         )
 
     logger.info("mcp_list_tools_done request_id=%s count=%s", request_id, len(out))
     return out
+
+
+async def call_mcp_tool(name: str, arguments: dict[str, Any], request_id: str) -> Any:
+    """Execute a single MCP tool and return the normalized result payload."""
+    results = await call_mcp_tools([{"name": name, "arguments": arguments}], request_id)
+    if not results:
+        return None
+    return results[0].get("result")
+
+
+async def list_openai_function_tools(
+    request_id: str,
+    schema: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Convert MCP tools to OpenAI function tools (delegates to ``mcp_tools``)."""
+    from cs_ai_bridge_api.mcp_tools import build_openai_function_tools
+
+    return await build_openai_function_tools(request_id, schema)
