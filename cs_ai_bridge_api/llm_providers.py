@@ -92,34 +92,6 @@ def _truncate_body(value: Any, limit: int = 4000) -> Any:
     return value
 
 
-def _extract_responses_output_text(data: dict[str, Any]) -> str:
-    """Aggregate assistant text from an OpenAI Responses API JSON body."""
-    top = data.get("output_text")
-    if isinstance(top, str) and top:
-        return top
-
-    texts: list[str] = []
-    output = data.get("output")
-    if not isinstance(output, list):
-        return ""
-
-    for item in output:
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            block_type = block.get("type")
-            if block_type == "output_text" and isinstance(block.get("text"), str):
-                texts.append(block["text"])
-            elif block_type == "refusal" and isinstance(block.get("refusal"), str):
-                texts.append(block["refusal"])
-    return "".join(texts)
-
-
 def _response_body_or_text(response: httpx.Response) -> Any:
     ct = response.headers.get("content-type", "")
     if "application/json" in ct:
@@ -238,97 +210,6 @@ def _openai_responses_url(redis_cfg: dict[str, Any]) -> str:
     return f"{_normalize_base_url(raw.strip())}/responses"
 
 
-def _messages_to_responses_input(
-    messages: list[dict[str, Any]],
-) -> tuple[str | None, list[dict[str, Any]]]:
-    """Map chat messages to OpenAI Responses API ``input`` items.
-
-    Assistant history must use ``output_text`` blocks; user/developer use ``input_text``.
-    System prompts are returned separately as ``instructions``.
-    """
-    instructions_parts: list[str] = []
-    out: list[dict[str, Any]] = []
-    for msg in messages:
-        role = str(msg.get("role", "user")).strip().lower()
-        text = _message_text(msg.get("content"))
-
-        if role == "system":
-            if text:
-                instructions_parts.append(text)
-            continue
-
-        if role == "assistant":
-            out_role = "assistant"
-            block_type = "output_text"
-        elif role == "tool":
-            out_role = "user"
-            block_type = "input_text"
-            if text:
-                text = f"[tool]\n{text}"
-        elif role in {"user", "developer"}:
-            out_role = role
-            block_type = "input_text"
-        else:
-            out_role = "user"
-            block_type = "input_text"
-            if text:
-                text = f"[{role}]\n{text}"
-
-        if not text and out_role != "assistant":
-            continue
-
-        out.append(
-            {
-                "role": out_role,
-                "content": [
-                    {
-                        "type": block_type,
-                        "text": text,
-                    }
-                ],
-            }
-        )
-
-    instructions = "\n\n".join(instructions_parts) if instructions_parts else None
-    return instructions, out
-
-
-def _responses_to_chat_completion_shape(data: dict[str, Any], model: str) -> dict[str, Any]:
-    from cs_ai_bridge_api.mcp_format import ensure_assistant_text
-
-    text = ensure_assistant_text(_extract_responses_output_text(data))
-    created = int(time.time())
-    usage_raw = data.get("usage")
-    usage: dict[str, int] = {}
-    if isinstance(usage_raw, dict):
-        inp = usage_raw.get("input_tokens")
-        outp = usage_raw.get("output_tokens")
-        total = usage_raw.get("total_tokens")
-        if isinstance(inp, int):
-            usage["prompt_tokens"] = inp
-        if isinstance(outp, int):
-            usage["completion_tokens"] = outp
-        if isinstance(total, int):
-            usage["total_tokens"] = total
-
-    return {
-        "id": data.get("id") or f"resp-{created}",
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "provider": "openai",
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": usage or None,
-        "response": data,
-    }
-
-
 def _timeout_seconds(redis_cfg: dict[str, Any]) -> float:
     v = redis_cfg.get("timeout_seconds")
     if isinstance(v, (int, float)) and v > 0:
@@ -336,18 +217,14 @@ def _timeout_seconds(redis_cfg: dict[str, Any]) -> float:
     return float(os.getenv("CS_AI_BRIDGE_LLM_TIMEOUT", "120"))
 
 
-def _message_text(content: Any) -> str:
+def _messages_to_gemini(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
     from cs_ai_bridge_api.mcp_format import normalize_message_content
 
-    return normalize_message_content(content)
-
-
-def _messages_to_gemini(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
     system_chunks: list[str] = []
     contents: list[dict[str, Any]] = []
     for msg in messages:
         role = (msg.get("role") or "user").strip().lower()
-        text = _message_text(msg.get("content"))
+        text = normalize_message_content(msg.get("content"))
         if role == "system":
             if text:
                 system_chunks.append(text)
@@ -529,7 +406,9 @@ async def upstream_chat_completion(
             )
             return run.response
 
-        instructions, responses_input = _messages_to_responses_input(messages)
+        from cs_ai_bridge_api.openai_responses import messages_to_responses_input
+
+        instructions, responses_input = messages_to_responses_input(messages)
         if not responses_input:
             raise HTTPException(
                 status_code=400,
@@ -609,13 +488,14 @@ async def upstream_chat_completion(
                 message="OpenAI returned unexpected JSON root.",
                 body=data,
             )
-        assistant_text = _extract_responses_output_text(data)
+        from cs_ai_bridge_api.openai_responses import extract_output_text, to_chat_completion_shape
+
         logger.info(
             "upstream_openai_assistant_text len=%s preview=%s",
-            len(assistant_text),
-            _safe_detail(assistant_text[:500] if assistant_text else "<empty>"),
+            len(extract_output_text(data)),
+            _safe_detail(extract_output_text(data)[:500] or "<empty>"),
         )
-        return _responses_to_chat_completion_shape(data, model)
+        return to_chat_completion_shape(data, model)
 
     # Gemini
     api_key = resolve_gemini_api_key(redis_cfg)

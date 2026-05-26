@@ -13,6 +13,11 @@ from fastapi import HTTPException
 
 from cs_ai_bridge_api.mcp_client import call_mcp_tool
 from cs_ai_bridge_api.mcp_tools import build_openai_function_tools, schema_summary_for_instructions
+from cs_ai_bridge_api.openai_responses import (
+    extract_function_calls,
+    messages_to_responses_input,
+    to_chat_completion_shape,
+)
 from cs_ai_bridge_api.schema_redis import normalize_tenant, read_schema_metadata
 from cs_ai_bridge_api.schema_validate import validate_tool_call
 
@@ -73,7 +78,6 @@ async def execute_validated_mcp_tool(
     tenant: str | None,
     request_id: str,
 ) -> dict[str, Any]:
-    """Validate against schema, then execute MCP tool locally."""
     normalized_tenant = normalize_tenant(tenant)
     args = _inject_tenant(arguments, normalized_tenant)
     validate_tool_call(tool_name, args, schema, normalized_tenant)
@@ -86,76 +90,25 @@ async def execute_validated_mcp_tool(
         ",".join(sorted(args.keys())),
     )
     result = await call_mcp_tool(tool_name, args, request_id)
-    return {
-        "name": tool_name,
-        "arguments": args,
-        "result": result,
-    }
-
-
-def extract_function_calls(response: dict[str, Any]) -> list[dict[str, Any]]:
-    calls: list[dict[str, Any]] = []
-    output = response.get("output")
-    if not isinstance(output, list):
-        return calls
-    for item in output:
-        if isinstance(item, dict) and item.get("type") == "function_call":
-            calls.append(item)
-    return calls
-
-
-def extract_response_text(response: dict[str, Any]) -> str:
-    top = response.get("output_text")
-    if isinstance(top, str) and top:
-        return top
-
-    texts: list[str] = []
-    output = response.get("output")
-    if not isinstance(output, list):
-        return ""
-
-    for item in output:
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "output_text" and isinstance(block.get("text"), str):
-                texts.append(block["text"])
-            elif block.get("type") == "refusal" and isinstance(block.get("refusal"), str):
-                texts.append(block["refusal"])
-    return "".join(texts)
+    return {"name": tool_name, "arguments": args, "result": result}
 
 
 def _tool_output_payload(execution: dict[str, Any]) -> str:
     if "error" in execution:
-        try:
-            return json.dumps({"error": execution["error"]}, ensure_ascii=False, default=str)
-        except (TypeError, ValueError):
-            return str(execution["error"])
-    payload = execution.get("result")
-    try:
-        return json.dumps(payload, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        return str(payload)
+        return json.dumps({"error": execution["error"]}, ensure_ascii=False, default=str)
+    return json.dumps(execution.get("result"), ensure_ascii=False, default=str)
 
 
 def _function_call_output_items(pairs: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for call_id, execution in pairs:
-        if not call_id:
-            continue
-        items.append(
-            {
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": _tool_output_payload(execution),
-            }
-        )
-    return items
+    return [
+        {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": _tool_output_payload(execution),
+        }
+        for call_id, execution in pairs
+        if call_id
+    ]
 
 
 async def _post_responses(
@@ -166,8 +119,7 @@ async def _post_responses(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     response = await client.post(url, json=payload, headers=headers)
-    content_type = response.headers.get("content-type", "")
-    if "application/json" not in content_type:
+    if "application/json" not in response.headers.get("content-type", ""):
         raise HTTPException(
             status_code=502,
             detail={
@@ -202,34 +154,20 @@ async def run_openai_responses_with_mcp(
     timeout: float,
     temperature: float | None = None,
     max_output_tokens: int | None = None,
-    extra_instructions: str | None = None,
 ) -> OrchestratorRun:
-    """
-    OpenAI Responses tool loop:
-    load MCP tools → OpenAI function tools → model calls → gateway executes MCP → final answer.
-    """
-    from cs_ai_bridge_api.llm_providers import (
-        _messages_to_responses_input,
-        _responses_to_chat_completion_shape,
-    )
-
     schema = load_tenant_schema(tenant)
     tools = await build_openai_function_tools(request_id, schema)
 
-    instructions, input_items = _messages_to_responses_input(messages)
+    instructions, input_items = messages_to_responses_input(messages)
     if not input_items:
         raise HTTPException(
             status_code=400,
             detail="At least one non-system user or assistant message is required.",
         )
 
-    schema_instructions = schema_summary_for_instructions(schema)
-    instruction_parts = [schema_instructions]
+    merged_instructions = schema_summary_for_instructions(schema)
     if instructions:
-        instruction_parts.append(instructions)
-    if extra_instructions:
-        instruction_parts.append(extra_instructions)
-    merged_instructions = "\n\n".join(part for part in instruction_parts if part.strip())
+        merged_instructions = f"{merged_instructions}\n\n{instructions}"
 
     base_payload: dict[str, Any] = {
         "model": model,
@@ -251,33 +189,24 @@ async def run_openai_responses_with_mcp(
     async with httpx.AsyncClient(timeout=timeout) as client:
         for round_index in range(max_tool_rounds()):
             rounds_completed = round_index + 1
-            payload = dict(base_payload)
-            payload["input"] = current_input
+            payload = {**base_payload, "input": current_input}
             if previous_response_id:
                 payload["previous_response_id"] = previous_response_id
 
             logger.info(
-                "mcp_orchestrator_round request_id=%s round=%s previous_response_id=%s",
+                "mcp_orchestrator_round request_id=%s round=%s",
                 request_id,
-                round_index + 1,
-                previous_response_id or "<none>",
+                rounds_completed,
             )
 
-            last_response = await _post_responses(
-                client,
-                url=url,
-                headers=headers,
-                payload=payload,
-            )
+            last_response = await _post_responses(client, url=url, headers=headers, payload=payload)
             previous_response_id = str(last_response.get("id", "")) or None
 
             function_calls = extract_function_calls(last_response)
             if not function_calls:
                 break
 
-            round_executions: list[dict[str, Any]] = []
             output_pairs: list[tuple[str, dict[str, Any]]] = []
-
             for call in function_calls:
                 call_id = str(call.get("call_id", "")).strip()
                 tool_name = str(call.get("name", "")).strip()
@@ -291,53 +220,36 @@ async def run_openai_responses_with_mcp(
                         "arguments": call.get("arguments"),
                         "error": str(exc),
                     }
-                    round_executions.append(execution)
-                    if call_id:
-                        output_pairs.append((call_id, execution))
-                    continue
-
-                try:
-                    execution = await execute_validated_mcp_tool(
-                        tool_name=tool_name,
-                        arguments=args,
-                        schema=schema,
-                        tenant=tenant,
-                        request_id=request_id,
-                    )
-                except (ValueError, HTTPException) as exc:
-                    detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-                    execution = {
-                        "name": tool_name,
-                        "arguments": args,
-                        "error": detail,
-                    }
-                round_executions.append(execution)
+                else:
+                    try:
+                        execution = await execute_validated_mcp_tool(
+                            tool_name=tool_name,
+                            arguments=args,
+                            schema=schema,
+                            tenant=tenant,
+                            request_id=request_id,
+                        )
+                    except (ValueError, HTTPException) as exc:
+                        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                        execution = {
+                            "name": tool_name,
+                            "arguments": args,
+                            "error": detail,
+                        }
+                all_executions.append(execution)
                 if call_id:
                     output_pairs.append((call_id, execution))
 
-            all_executions.extend(round_executions)
             output_items = _function_call_output_items(output_pairs)
             if not output_items:
-                logger.warning(
-                    "mcp_orchestrator_no_outputs request_id=%s round=%s",
-                    request_id,
-                    round_index + 1,
-                )
                 break
-
             current_input = output_items
 
-    shaped = _responses_to_chat_completion_shape(last_response, model)
+    shaped = to_chat_completion_shape(last_response, model)
     shaped["mcp_tool_executions"] = all_executions
     shaped["mcp_orchestrator_rounds"] = rounds_completed
     shaped["answer_source"] = "openai_responses_orchestrator"
-
     if rounds_completed >= max_tool_rounds() and extract_function_calls(last_response):
-        logger.warning(
-            "mcp_orchestrator_max_rounds request_id=%s rounds=%s",
-            request_id,
-            rounds_completed,
-        )
         shaped["orchestrator_warning"] = "max_tool_rounds_reached"
 
     return OrchestratorRun(

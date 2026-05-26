@@ -1,4 +1,4 @@
-"""Normalize MCP / Odoo payloads and format them for LLM and API clients."""
+"""Normalize MCP / Odoo payloads and format them for clients."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ _SCHEMA_TOOL = "get_schema_metadata"
 
 
 def normalize_message_content(content: Any) -> str:
-    """Turn message ``content`` into plain text (never leave opaque objects)."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -20,9 +19,7 @@ def normalize_message_content(content: Any) -> str:
             if isinstance(block, str):
                 parts.append(block)
             elif isinstance(block, dict):
-                if block.get("type") == "text" and isinstance(block.get("text"), str):
-                    parts.append(block["text"])
-                elif isinstance(block.get("text"), str):
+                if isinstance(block.get("text"), str):
                     parts.append(block["text"])
                 else:
                     parts.append(json.dumps(block, ensure_ascii=False))
@@ -37,7 +34,6 @@ def normalize_message_content(content: Any) -> str:
 
 
 def field_to_display(value: Any) -> str:
-    """Human-readable scalar for Odoo fields (many2one, x2many, nested dicts)."""
     if value is None:
         return ""
     if isinstance(value, bool):
@@ -59,10 +55,10 @@ def field_to_display(value: Any) -> str:
             return f"{name} (id {record_id})"
         if name is not None:
             return str(name)
-        if record_id is not None and len(value) <= 2:
-            return f"id {record_id}"
-        flat = {str(k): field_to_display(v) for k, v in value.items()}
-        return json.dumps(flat, ensure_ascii=False)
+        return json.dumps(
+            {str(k): field_to_display(v) for k, v in value.items()},
+            ensure_ascii=False,
+        )
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
@@ -71,61 +67,48 @@ def normalize_record(record: dict[str, Any]) -> dict[str, str]:
 
 
 def normalize_business_payload(value: Any) -> Any:
-    """Unwrap JSON-RPC and normalize nested record lists."""
     if isinstance(value, dict):
         if value.get("jsonrpc") and "result" in value:
             return normalize_business_payload(value["result"])
-        if "error" in value and "result" not in value:
-            return value
 
         records = _records_from_payload(value)
         if records is not None:
             return {"records": records}
 
-        out: dict[str, Any] = {}
-        for key, val in value.items():
-            if key == "records" and isinstance(val, list):
-                out[key] = [
-                    normalize_record(row) if isinstance(row, dict) else field_to_display(row)
-                    for row in val
-                ]
-            else:
-                out[key] = normalize_field_value(val)
-        return out
+        return {
+            key: (
+                [normalize_record(row) if isinstance(row, dict) else field_to_display(row) for row in val]
+                if key == "records" and isinstance(val, list)
+                else _normalize_field_value(val)
+            )
+            for key, val in value.items()
+        }
 
-    if isinstance(value, list):
-        if value and all(isinstance(row, dict) for row in value):
-            return {"records": [normalize_record(row) for row in value]}
-        return [normalize_field_value(item) for item in value]
-    return normalize_field_value(value)
+    if isinstance(value, list) and value and all(isinstance(row, dict) for row in value):
+        return {"records": [normalize_record(row) for row in value]}
+    return _normalize_field_value(value)
 
 
-def normalize_field_value(value: Any) -> Any:
+def _normalize_field_value(value: Any) -> Any:
     if isinstance(value, dict):
         if "display_name" in value or ("id" in value and "name" in value):
             return field_to_display(value)
-        return {str(k): normalize_field_value(v) for k, v in value.items()}
+        return {str(k): _normalize_field_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         if len(value) == 2 and isinstance(value[0], int) and isinstance(value[1], str):
             return field_to_display(value)
-        return [normalize_field_value(v) for v in value]
+        return [_normalize_field_value(v) for v in value]
     return value
 
 
 def unwrap_tool_payload(value: Any) -> Any:
-    """Extract business data from a CallToolResult-shaped dict."""
     if not isinstance(value, dict):
         return normalize_business_payload(value)
 
-    if "structured_content" in value or "content" in value or "data" in value:
-        structured = value.get("structured_content")
-        if structured is not None:
-            return normalize_business_payload(structured)
-
-        data = value.get("data")
-        if data is not None:
-            return normalize_business_payload(data)
-
+    if any(key in value for key in ("structured_content", "content", "data")):
+        for key in ("structured_content", "data"):
+            if value.get(key) is not None:
+                return normalize_business_payload(value[key])
         parsed = _parse_content_blocks(value.get("content"))
         if parsed is not None:
             return normalize_business_payload(parsed)
@@ -134,19 +117,14 @@ def unwrap_tool_payload(value: Any) -> Any:
 
 
 def _parse_content_blocks(content: Any) -> Any | None:
-    if content is None:
-        return None
     if isinstance(content, str):
         return _maybe_parse_json(content)
     if isinstance(content, list):
-        texts: list[str] = []
-        for block in content:
-            if isinstance(block, dict):
-                text = block.get("text")
-                if isinstance(text, str):
-                    texts.append(text)
-            elif hasattr(block, "text") and isinstance(getattr(block, "text"), str):
-                texts.append(getattr(block, "text"))
+        texts = [
+            block.get("text")
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
         if not texts:
             return None
         combined = "\n".join(texts)
@@ -164,15 +142,9 @@ def _maybe_parse_json(text: str) -> Any | None:
         return None
 
 
-def _looks_like_record(row: Any) -> bool:
-    return isinstance(row, dict) and bool(row) and "id" in row
-
-
 def _records_from_payload(payload: Any) -> list[dict[str, str]] | None:
-    if isinstance(payload, list):
-        if payload and all(_looks_like_record(row) for row in payload):
-            return [normalize_record(row) for row in payload]
-        return None
+    if isinstance(payload, list) and payload and all(isinstance(row, dict) and row.get("id") for row in payload):
+        return [normalize_record(row) for row in payload]
     if not isinstance(payload, dict):
         return None
 
@@ -188,105 +160,107 @@ def _records_from_payload(payload: Any) -> list[dict[str, str]] | None:
 
 
 def format_payload_content(payload: Any) -> str:
-    """Format business payload as plain text (no tool names or JSON wrappers)."""
     records = _records_from_payload(payload) if payload is not None else None
     if records:
         blocks: list[str] = []
         for index, row in enumerate(records, start=1):
-            lines = [f"Record {index}:"]
-            for key in sorted(row.keys()):
-                value = row.get(key, "")
-                if value:
-                    lines.append(f"- {key}: {value}")
+            lines = [f"Record {index}:"] + [
+                f"- {key}: {value}" for key, value in sorted(row.items()) if value
+            ]
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks)
 
     if isinstance(payload, dict):
-        lines = [f"- {key}: {field_to_display(val)}" for key, val in sorted(payload.items())]
-        return "\n".join(lines)
-    if payload is None:
-        return ""
-    return field_to_display(payload)
+        return "\n".join(
+            f"- {key}: {field_to_display(val)}" for key, val in sorted(payload.items())
+        )
+    return field_to_display(payload) if payload is not None else ""
 
 
-def format_mcp_results_for_context(
+def format_mcp_results_text(
     mcp_results: list[dict[str, Any]],
     *,
-    schema_summary: str = "",
+    include_instructions: bool = False,
 ) -> str:
-    """Plain business data for the LLM (records + optional schema summary)."""
-    from cs_ai_bridge_api.mcp_intent import format_schema_summary, schema_from_mcp_results
-
-    sections: list[str] = [
-        "You have live Odoo ERP data below. Answer the user using these records. "
-        "Do not refuse listing customers, contacts, invoices, or other business data "
-        "when records are attached.",
-    ]
-    if schema_summary.strip():
-        sections.append(schema_summary.strip())
-    else:
-        schema = schema_from_mcp_results(mcp_results)
-        if schema:
-            summary = format_schema_summary(schema)
-            if summary.strip():
-                sections.append(summary)
-
-    for entry in mcp_results:
-        if str(entry.get("name", "")).strip() == _SCHEMA_TOOL:
-            continue
-        payload = entry.get("result")
-        formatted = format_payload_content(payload)
-        if formatted.strip():
-            sections.append(formatted)
-    return "\n\n".join(sections)
-
-
-def format_mcp_results_plain(mcp_results: list[dict[str, Any]]) -> str:
-    """Human-readable fallback answer built from MCP query results."""
+    """Plain-text MCP results for system context or fallback answers."""
     sections: list[str] = []
+    if include_instructions:
+        sections.append(
+            "Live Odoo data below. Answer using these records; do not refuse listing business data."
+        )
+
     for entry in mcp_results:
         if str(entry.get("name", "")).strip() == _SCHEMA_TOOL:
             continue
-        payload = entry.get("result")
-        formatted = format_payload_content(payload)
+        formatted = format_payload_content(entry.get("result"))
         if formatted.strip():
             sections.append(formatted)
+
     if not sections:
-        return "No matching records were found."
+        return "No matching records were found." if not include_instructions else ""
     return "\n\n".join(sections)
 
 
 def normalize_mcp_results_list(mcp_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for entry in mcp_results:
-        raw = entry.get("result")
-        payload = unwrap_tool_payload(raw)
-        out.append(
-            {
-                "name": entry.get("name"),
-                "arguments": entry.get("arguments"),
-                "result": payload,
-            }
-        )
-    return out
+    return [
+        {
+            "name": entry.get("name"),
+            "arguments": entry.get("arguments"),
+            "result": unwrap_tool_payload(entry.get("result")),
+        }
+        for entry in mcp_results
+    ]
 
 
 def normalize_chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         copy = dict(msg)
         if "content" in copy:
             copy["content"] = normalize_message_content(copy.get("content"))
-        normalized.append(copy)
-    return normalized
+        out.append(copy)
+    return out
 
 
 def ensure_assistant_text(content: Any) -> str:
     text = normalize_message_content(content)
     if text.strip() in {"", "[object Object]"}:
         return ""
-    if "[object Object]" in text:
-        return text.replace("[object Object]", "").strip()
-    return text
+    return text.replace("[object Object]", "").strip() if "[object Object]" in text else text
+
+
+def finalize_chat_response(
+    result: dict[str, Any],
+    mcp_results: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Ensure ``content`` is a string and apply MCP fallback when needed."""
+    choices = result.get("choices")
+    message = choices[0].get("message") if isinstance(choices, list) and choices else {}
+    content = ensure_assistant_text(message.get("content") if isinstance(message, dict) else "")
+
+    if mcp_results is not None:
+        mcp_text = format_mcp_results_text(mcp_results)
+        result["mcp_results_text"] = mcp_text
+        if not content or "[object Object]" in content:
+            content = mcp_text
+            result["answer_source"] = "mcp_fallback"
+
+    if isinstance(choices, list) and choices:
+        choices[0]["message"] = {"role": "assistant", "content": content}
+    else:
+        result["choices"] = [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ]
+    result["content"] = content
+
+    if mcp_results is not None:
+        result["mcp_results"] = mcp_results
+    elif result.get("mcp_tool_executions") is not None:
+        result["mcp_results"] = result["mcp_tool_executions"]
+    return result

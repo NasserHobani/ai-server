@@ -140,13 +140,3 @@ async def call_mcp_tool(name: str, arguments: dict[str, Any], request_id: str) -
     if not results:
         return None
     return results[0].get("result")
-
-
-async def list_openai_function_tools(
-    request_id: str,
-    schema: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    """Convert MCP tools to OpenAI function tools (delegates to ``mcp_tools``)."""
-    from cs_ai_bridge_api.mcp_tools import build_openai_function_tools
-
-    return await build_openai_function_tools(request_id, schema)
