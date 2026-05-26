@@ -92,6 +92,12 @@ async def call_mcp_tools(
                 name,
                 ",".join(sorted(arguments.keys())),
             )
+            logger.info(
+                "mcp_tool_request request_id=%s url=%s payload=%s",
+                request_id,
+                url,
+                _jsonable({"name": name, "arguments": arguments}),
+            )
             result = await client.call_tool(name, arguments)
             results.append(
                 {

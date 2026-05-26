@@ -12,6 +12,8 @@ from cs_ai_bridge_api.schema_utils import (
     field_names_for_model,
     model_label,
     models_for_operation,
+    required_create_fields_for_model,
+    writable_field_names_for_model,
 )
 
 
@@ -52,18 +54,35 @@ def _enrich_description(base: str, schema: dict[str, Any] | None, tool_name: str
     elif tool_name == "mcp_create":
         create_models = models_for_operation(schema, "create")
         if create_models:
-            parts.append(
-                "Creatable models: "
-                + ", ".join(f"{model_label(schema, m)} (`{m}`)" for m in create_models[:30])
-            )
+            lines = ["Creatable models (use only schema-writable fields in `vals`):"]
+            for model in create_models[:20]:
+                required = required_create_fields_for_model(schema, model)
+                writable = writable_field_names_for_model(schema, model, operation="create")
+                req_preview = ", ".join(required[:8]) if required else "none"
+                writable_preview = ", ".join(writable[:12]) if writable else "see schema"
+                if len(writable) > 12:
+                    writable_preview += ", ..."
+                lines.append(
+                    f"- {model_label(schema, model)} (`{model}`): required={req_preview}; writable={writable_preview}"
+                )
+            parts.append("\n".join(lines))
     elif tool_name == "mcp_write":
         write_models = models_for_operation(schema, "write")
         if write_models:
-            parts.append(
-                "Writable models: "
-                + ", ".join(f"{model_label(schema, m)} (`{m}`)" for m in write_models[:30])
-            )
+            lines = ["Writable models (update only schema-writable fields in `vals`):"]
+            for model in write_models[:20]:
+                writable = writable_field_names_for_model(schema, model, operation="write")
+                writable_preview = ", ".join(writable[:12]) if writable else "see schema"
+                if len(writable) > 12:
+                    writable_preview += ", ..."
+                lines.append(
+                    f"- {model_label(schema, model)} (`{model}`): writable={writable_preview}"
+                )
+            parts.append("\n".join(lines))
 
+    parts.append(
+        "If a tool returns a validation or readonly-field error, immediately retry with corrected arguments."
+    )
     parts.append("Omit `fields` to use schema defaults. Pass `tenant` when required.")
     return "\n\n".join(parts)
 
@@ -182,4 +201,12 @@ def schema_summary_for_instructions(schema: dict[str, Any]) -> str:
     read_models = models_for_operation(schema, "read")
     if read_models:
         lines.append("Readable models: " + ", ".join(f"`{m}`" for m in read_models[:50]))
+    create_models = models_for_operation(schema, "create")
+    if create_models:
+        lines.append("Creatable models: " + ", ".join(f"`{m}`" for m in create_models[:30]))
+    write_models = models_for_operation(schema, "write")
+    if write_models:
+        lines.append("Writable models: " + ", ".join(f"`{m}`" for m in write_models[:30]))
+    lines.append("For create/write, include only schema-writable fields in `vals`.")
+    lines.append("Never set readonly fields; if a call fails, fix args and retry in the same response.")
     return "\n".join(lines)

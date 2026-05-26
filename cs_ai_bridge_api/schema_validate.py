@@ -84,6 +84,33 @@ def _required_create_fields(meta: dict[str, Any]) -> list[str]:
     return out
 
 
+def _writable_fields(meta: dict[str, Any]) -> list[str]:
+    fields = meta.get("fields")
+    if not isinstance(fields, dict):
+        return []
+    out: list[str] = []
+    for name, info in fields.items():
+        if str(name).startswith("_"):
+            continue
+        if isinstance(info, dict):
+            if info.get("readonly"):
+                continue
+            if info.get("can_write") is False:
+                continue
+        out.append(str(name))
+    return sorted(out)
+
+
+def _writable_fields_hint(meta: dict[str, Any], *, max_fields: int = 20) -> str:
+    writable = _writable_fields(meta)
+    if not writable:
+        return ""
+    preview = ", ".join(writable[:max_fields])
+    if len(writable) > max_fields:
+        preview += ", ..."
+    return f" Allowed writable fields: {preview}"
+
+
 def validate_mcp_query(
     schema: dict[str, Any],
     *,
@@ -161,13 +188,22 @@ def validate_mcp_create(
     for field_name in vals:
         info = fld.get(field_name)
         if not info:
-            raise ValueError(f"Field '{field_name}' is not allowed on '{model}' for create.")
+            raise ValueError(
+                f"Field '{field_name}' is not allowed on '{model}' for create."
+                + _writable_fields_hint(meta)
+            )
         if not isinstance(info, dict):
             continue
         if info.get("readonly"):
-            raise ValueError(f"Cannot set readonly field '{field_name}' on create.")
+            raise ValueError(
+                f"Cannot set readonly field '{field_name}' on create."
+                + _writable_fields_hint(meta)
+            )
         if info.get("can_write") is False:
-            raise ValueError(f"Field '{field_name}' is not writable on create.")
+            raise ValueError(
+                f"Field '{field_name}' is not writable on create."
+                + _writable_fields_hint(meta)
+            )
 
     missing = [name for name in _required_create_fields(meta) if name not in vals]
     if missing:
@@ -210,13 +246,22 @@ def validate_mcp_write(
     for field_name in vals:
         info = fld.get(field_name)
         if not info:
-            raise ValueError(f"Field '{field_name}' is not allowed on '{model}' for write.")
+            raise ValueError(
+                f"Field '{field_name}' is not allowed on '{model}' for write."
+                + _writable_fields_hint(meta)
+            )
         if not isinstance(info, dict):
             continue
         if info.get("readonly"):
-            raise ValueError(f"Cannot set readonly field '{field_name}' on write.")
+            raise ValueError(
+                f"Cannot set readonly field '{field_name}' on write."
+                + _writable_fields_hint(meta)
+            )
         if info.get("can_write") is False:
-            raise ValueError(f"Field '{field_name}' is not writable on write.")
+            raise ValueError(
+                f"Field '{field_name}' is not writable on write."
+                + _writable_fields_hint(meta)
+            )
 
 
 def validate_tool_call(
