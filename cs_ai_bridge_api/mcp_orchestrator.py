@@ -99,16 +99,71 @@ def _tool_output_payload(execution: dict[str, Any]) -> str:
     return json.dumps(execution.get("result"), ensure_ascii=False, default=str)
 
 
-def _function_call_output_items(pairs: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": _tool_output_payload(execution),
-        }
-        for call_id, execution in pairs
-        if call_id
-    ]
+def _call_id_from_function_call(call: dict[str, Any]) -> str:
+    for key in ("call_id", "id"):
+        value = call.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _sanitize_function_call_item(call: dict[str, Any]) -> dict[str, Any]:
+    """Minimal function_call item for Responses ``input`` (avoids unknown/null fields)."""
+    arguments = call.get("arguments")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+
+    item: dict[str, Any] = {
+        "type": "function_call",
+        "name": str(call.get("name", "")),
+        "arguments": arguments,
+    }
+    call_id = _call_id_from_function_call(call)
+    if call_id:
+        item["call_id"] = call_id
+    return item
+
+
+def _append_pre_tool_output_items(
+    conversation_input: list[dict[str, Any]],
+    response: dict[str, Any],
+) -> None:
+    """Reasoning models may require reasoning output items before tool continuations."""
+    output = response.get("output")
+    if not isinstance(output, list):
+        return
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "function_call":
+            break
+        if item_type == "reasoning":
+            conversation_input.append(item)
+
+
+def _append_tool_results_to_conversation(
+    conversation_input: list[dict[str, Any]],
+    call_execution_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> None:
+    """Append function_call + function_call_output pairs (required by Responses API)."""
+    for call, execution in call_execution_pairs:
+        call_id = _call_id_from_function_call(call)
+        if not call_id:
+            logger.warning(
+                "function_call missing call_id tool=%s keys=%s",
+                call.get("name"),
+                sorted(call.keys()),
+            )
+            continue
+        conversation_input.append(_sanitize_function_call_item(call))
+        conversation_input.append(
+            {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": _tool_output_payload(execution),
+            }
+        )
 
 
 async def _post_responses(
@@ -130,6 +185,11 @@ async def _post_responses(
         )
     data = response.json()
     if response.is_error:
+        logger.warning(
+            "openai_responses_error status=%s body=%s",
+            response.status_code,
+            json.dumps(data, ensure_ascii=False)[:2000],
+        )
         raise HTTPException(
             status_code=response.status_code,
             detail={
@@ -181,34 +241,32 @@ async def run_openai_responses_with_mcp(
         base_payload["max_output_tokens"] = max_output_tokens
 
     all_executions: list[dict[str, Any]] = []
-    previous_response_id: str | None = None
-    current_input: Any = input_items
+    # Cumulative input (works with store=false). Do not use previous_response_id alone on
+    # round 2+ — it often 400s when store is disabled.
+    conversation_input: list[dict[str, Any]] = list(input_items)
     last_response: dict[str, Any] = {}
     rounds_completed = 0
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         for round_index in range(max_tool_rounds()):
             rounds_completed = round_index + 1
-            payload = {**base_payload, "input": current_input}
-            if previous_response_id:
-                payload["previous_response_id"] = previous_response_id
+            payload = {**base_payload, "input": conversation_input}
 
             logger.info(
-                "mcp_orchestrator_round request_id=%s round=%s",
+                "mcp_orchestrator_round request_id=%s round=%s input_items=%s",
                 request_id,
                 rounds_completed,
+                len(conversation_input),
             )
 
             last_response = await _post_responses(client, url=url, headers=headers, payload=payload)
-            previous_response_id = str(last_response.get("id", "")) or None
 
             function_calls = extract_function_calls(last_response)
             if not function_calls:
                 break
 
-            output_pairs: list[tuple[str, dict[str, Any]]] = []
+            call_execution_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
             for call in function_calls:
-                call_id = str(call.get("call_id", "")).strip()
                 tool_name = str(call.get("name", "")).strip()
                 if not tool_name:
                     continue
@@ -236,14 +294,11 @@ async def run_openai_responses_with_mcp(
                             "arguments": args,
                             "error": detail,
                         }
-                all_executions.append(execution)
-                if call_id:
-                    output_pairs.append((call_id, execution))
+                call_execution_pairs.append((call, execution))
 
-            output_items = _function_call_output_items(output_pairs)
-            if not output_items:
-                break
-            current_input = output_items
+            all_executions.extend([exec_ for _, exec_ in call_execution_pairs])
+            _append_pre_tool_output_items(conversation_input, last_response)
+            _append_tool_results_to_conversation(conversation_input, call_execution_pairs)
 
     shaped = to_chat_completion_shape(last_response, model)
     shaped["mcp_tool_executions"] = all_executions
